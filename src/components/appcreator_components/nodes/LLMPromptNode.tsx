@@ -225,16 +225,7 @@ const LLMPromptNode = ({ data, isConnectable }: any) => {
         id="text-in"
         isConnectable={isConnectable}
         className="!bg-blue-500 !w-3 !h-3"
-        style={{ left: '30%', top: -6 }}
-      />
-      
-      <Handle
-        type="target"
-        position={Position.Top}
-        id="image-in"
-        isConnectable={isConnectable}
-        className="!bg-pink-500 !w-3 !h-3"
-        style={{ left: '70%', top: -6 }}
+        style={{ top: -6 }}
       />
       
       <Handle
