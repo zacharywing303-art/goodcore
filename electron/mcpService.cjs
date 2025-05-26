@@ -473,6 +473,11 @@ class MCPService {
         };
       }
 
+      // Handle special MCP protocol methods
+      if (toolName === 'tools/list') {
+        return await this.listToolsFromServer(serverName, callId);
+      }
+
       // For now, we'll implement basic MCP protocol communication
       // This is a simplified implementation - a full MCP client would handle the complete protocol
       const mcpRequest = {
@@ -488,6 +493,9 @@ class MCPService {
       // Send the request to the MCP server via stdin
       const requestString = JSON.stringify(mcpRequest) + '\n';
       
+      log.info(`[${serverName}] Sending MCP request:`, mcpRequest);
+      log.info(`[${serverName}] Request string:`, requestString);
+      
       return new Promise((resolve) => {
         let responseData = '';
         let timeoutId;
@@ -496,44 +504,77 @@ class MCPService {
         const onData = (data) => {
           responseData += data.toString();
           
+          // Log raw response data for debugging
+          log.info(`[${serverName}] Raw response data:`, data.toString());
+          log.info(`[${serverName}] Accumulated responseData:`, responseData);
+          
           // Try to parse JSON response
           try {
             const lines = responseData.split('\n').filter(line => line.trim());
+            log.info(`[${serverName}] Split into ${lines.length} lines:`, lines);
+            
             for (const line of lines) {
-              const response = JSON.parse(line);
-              if (response.id === callId) {
-                // Clean up
-                clearTimeout(timeoutId);
-                serverInfo.process.stdout.off('data', onData);
+              // Only try to parse lines that look like JSON (start with { or [)
+              const trimmedLine = line.trim();
+              log.info(`[${serverName}] Processing line:`, trimmedLine);
+              
+              if (!trimmedLine.startsWith('{') && !trimmedLine.startsWith('[')) {
+                log.info(`[${serverName}] Skipping non-JSON line:`, trimmedLine);
+                continue;
+              }
+              
+              log.info(`[${serverName}] Attempting to parse JSON line:`, trimmedLine);
+              
+              try {
+                const response = JSON.parse(trimmedLine);
+                log.info(`[${serverName}] Successfully parsed JSON:`, response);
                 
-                if (response.error) {
-                  resolve({
-                    callId,
-                    success: false,
-                    error: response.error.message || 'MCP tool execution failed'
-                  });
+                if (response.id === callId) {
+                  log.info(`[${serverName}] Found matching response for callId:`, callId);
+                  // Clean up
+                  clearTimeout(timeoutId);
+                  serverInfo.process.stdout.off('data', onData);
+                  
+                  if (response.error) {
+                    log.error(`[${serverName}] MCP server returned error:`, response.error);
+                    resolve({
+                      callId,
+                      success: false,
+                      error: response.error.message || 'MCP tool execution failed'
+                    });
+                  } else {
+                    log.info(`[${serverName}] MCP server returned success:`, response.result);
+                    resolve({
+                      callId,
+                      success: true,
+                      content: response.result?.content || [{ type: 'text', text: JSON.stringify(response.result) }],
+                      metadata: {
+                        server: serverName,
+                        tool: toolName,
+                        executedAt: new Date().toISOString()
+                      }
+                    });
+                  }
+                  return;
                 } else {
-                  resolve({
-                    callId,
-                    success: true,
-                    content: response.result?.content || [{ type: 'text', text: JSON.stringify(response.result) }],
-                    metadata: {
-                      server: serverName,
-                      tool: toolName,
-                      executedAt: new Date().toISOString()
-                    }
-                  });
+                  log.info(`[${serverName}] Response ID ${response.id} doesn't match expected ${callId}`);
                 }
-                return;
+              } catch (lineParseError) {
+                // Skip malformed lines and continue
+                log.error(`[${serverName}] JSON parse error for line:`, trimmedLine, 'Error:', lineParseError.message);
+                continue;
               }
             }
           } catch (parseError) {
-            // Continue waiting for more data
+            // Log parsing errors but continue waiting for more data
+            log.error(`[${serverName}] Overall JSON parsing error:`, parseError.message, 'ResponseData:', responseData);
           }
         };
 
         // Set up timeout
         timeoutId = setTimeout(() => {
+          log.error(`[${serverName}] MCP tool execution timeout after 30 seconds`);
+          log.error(`[${serverName}] Final responseData:`, responseData);
           serverInfo.process.stdout.off('data', onData);
           resolve({
             callId,
@@ -547,8 +588,11 @@ class MCPService {
 
         // Send the request
         try {
+          log.info(`[${serverName}] Writing request to stdin...`);
           serverInfo.process.stdin.write(requestString);
+          log.info(`[${serverName}] Request sent successfully`);
         } catch (writeError) {
+          log.error(`[${serverName}] Failed to write request:`, writeError);
           clearTimeout(timeoutId);
           serverInfo.process.stdout.off('data', onData);
           resolve({
@@ -563,6 +607,120 @@ class MCPService {
       log.error(`Error executing MCP tool call:`, error);
       return {
         callId: toolCall.callId,
+        success: false,
+        error: error.message || 'Unknown error occurred'
+      };
+    }
+  }
+
+  // List tools from an MCP server
+  async listToolsFromServer(serverName, callId) {
+    try {
+      const serverInfo = this.servers.get(serverName);
+      if (!serverInfo || serverInfo.status !== 'running') {
+        return {
+          callId,
+          success: false,
+          error: `Server ${serverName} is not running`
+        };
+      }
+
+      const mcpRequest = {
+        jsonrpc: '2.0',
+        id: callId,
+        method: 'tools/list',
+        params: {}
+      };
+
+      const requestString = JSON.stringify(mcpRequest) + '\n';
+      
+      return new Promise((resolve) => {
+        let responseData = '';
+        let timeoutId;
+
+        const onData = (data) => {
+          responseData += data.toString();
+          
+          try {
+            const lines = responseData.split('\n').filter(line => line.trim());
+            for (const line of lines) {
+              // Only try to parse lines that look like JSON (start with { or [)
+              const trimmedLine = line.trim();
+              if (!trimmedLine.startsWith('{') && !trimmedLine.startsWith('[')) {
+                log.debug(`Skipping non-JSON line from ${serverName}:`, trimmedLine);
+                continue;
+              }
+              
+              try {
+                const response = JSON.parse(trimmedLine);
+                if (response.id === callId) {
+                  clearTimeout(timeoutId);
+                  serverInfo.process.stdout.off('data', onData);
+                  
+                  if (response.error) {
+                    resolve({
+                      callId,
+                      success: false,
+                      error: response.error.message || 'Failed to list tools'
+                    });
+                  } else {
+                    // Return the tools list in a format the frontend expects
+                    const tools = response.result?.tools || [];
+                    resolve({
+                      callId,
+                      success: true,
+                      content: [{ 
+                        type: 'json', 
+                        text: JSON.stringify(tools),
+                        data: tools 
+                      }],
+                      metadata: {
+                        server: serverName,
+                        tool: 'tools/list',
+                        executedAt: new Date().toISOString()
+                      }
+                    });
+                  }
+                  return;
+                }
+              } catch (lineParseError) {
+                log.debug(`Skipping malformed JSON line from ${serverName}:`, trimmedLine);
+                continue;
+              }
+            }
+          } catch (parseError) {
+            log.debug(`JSON parsing error for ${serverName}:`, parseError.message);
+          }
+        };
+
+        timeoutId = setTimeout(() => {
+          serverInfo.process.stdout.off('data', onData);
+          resolve({
+            callId,
+            success: false,
+            error: 'Tool listing timeout'
+          });
+        }, 10000); // 10 second timeout for listing
+
+        serverInfo.process.stdout.on('data', onData);
+
+        try {
+          serverInfo.process.stdin.write(requestString);
+        } catch (writeError) {
+          clearTimeout(timeoutId);
+          serverInfo.process.stdout.off('data', onData);
+          resolve({
+            callId,
+            success: false,
+            error: `Failed to send tools/list request: ${writeError.message}`
+          });
+        }
+      });
+
+    } catch (error) {
+      log.error(`Error listing tools from MCP server ${serverName}:`, error);
+      return {
+        callId,
         success: false,
         error: error.message || 'Unknown error occurred'
       };
