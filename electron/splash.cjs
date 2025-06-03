@@ -5,26 +5,23 @@ class SplashScreen {
   constructor() {
     const isDev = process.env.NODE_ENV === 'development';
     
-    // Get primary display dimensions
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width, height } = primaryDisplay.workAreaSize;
-    
-    // Calculate 80% of screen dimensions
-    const windowWidth = Math.floor(width * 0.8);
-    const windowHeight = Math.floor(height * 0.8);
-    
     this.window = new BrowserWindow({
-      width: windowWidth,
-      height: windowHeight,
+      fullscreen: true,
       frame: false,
-      transparent: true,
+      transparent: false,
       webPreferences: {
         nodeIntegration: true,
         contextIsolation: false
       },
       skipTaskbar: true,
       resizable: false,
-      center: true
+      alwaysOnTop: true,
+      show: false
+    });
+
+    // Show window when ready to prevent flash
+    this.window.once('ready-to-show', () => {
+      this.window.show();
     });
 
     // Log any errors
