@@ -1,5 +1,5 @@
 const { autoUpdater } = require('electron-updater');
-const { dialog } = require('electron');
+const { dialog, BrowserWindow } = require('electron');
 const { shell } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -36,14 +36,212 @@ try {
   logger = console;
 }
 
-// Constants for robust update handling
+// Enhanced constants for robust update handling with UX improvements
 const UPDATE_CONSTANTS = {
   GITHUB_API_TIMEOUT: 15000,
   MAX_RETRIES: 3,
   RETRY_DELAY: 2000,
   RATE_LIMIT_DELAY: 60000,
-  MAX_RELEASE_NOTES_LENGTH: 1000
+  MAX_RELEASE_NOTES_LENGTH: 2000, // Increased for better release notes
+  // Enhanced UX constants
+  NOTIFICATION_DELAY: 1500,
+  PROGRESS_UPDATE_INTERVAL: 500,
+  BACKGROUND_CHECK_INTERVAL: 24 * 60 * 60 * 1000, // 24 hours
+  AUTO_CHECK_STARTUP_DELAY: 30000, // 30 seconds after startup
+  DOWNLOAD_CHUNK_SIZE: 1024 * 1024, // 1MB chunks
 };
+
+// Update preferences management
+const UPDATE_PREFERENCES_KEY = 'clara-update-preferences';
+const DEFAULT_UPDATE_PREFERENCES = {
+  autoCheck: true,
+  checkFrequency: 'daily', // 'daily', 'weekly', 'monthly', 'manual'
+  notifyOnAvailable: true,
+  backgroundDownload: false, // For manual platforms
+  quietHours: {
+    enabled: false,
+    start: '22:00',
+    end: '08:00'
+  },
+  betaChannel: false,
+  lastAutoCheck: null,
+  dismissedVersions: [] // Versions user chose to skip
+};
+
+// Enhanced release notes processing with markdown support
+function processReleaseNotes(notes) {
+  if (!notes || typeof notes !== 'string') {
+    return {
+      plain: 'No release notes available.',
+      formatted: 'No release notes available.',
+      categories: {}
+    };
+  }
+  
+  // Enhanced sanitization while preserving markdown structure
+  let sanitized = notes
+    .replace(/<script[^>]*>.*?<\/script>/gis, '') // Remove scripts
+    .replace(/<iframe[^>]*>.*?<\/iframe>/gis, '') // Remove iframes
+    .replace(/javascript:/gi, '') // Remove javascript: URLs
+    .trim();
+  
+  // Parse and categorize content
+  const categories = {
+    'New Features': [],
+    'Improvements': [],
+    'Bug Fixes': [],
+    'Breaking Changes': [],
+    'Other': []
+  };
+  
+  // Simple markdown-aware categorization
+  const lines = sanitized.split('\n');
+  let currentCategory = 'Other';
+  
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    
+    // Detect category headers
+    if (trimmed.match(/^#+\s*(new features?|features?)/i)) {
+      currentCategory = 'New Features';
+      continue;
+    } else if (trimmed.match(/^#+\s*(improvements?|enhancements?)/i)) {
+      currentCategory = 'Improvements';
+      continue;
+    } else if (trimmed.match(/^#+\s*(bug fixes?|fixes?|bugfixes?)/i)) {
+      currentCategory = 'Bug Fixes';
+      continue;
+    } else if (trimmed.match(/^#+\s*(breaking changes?|breaking)/i)) {
+      currentCategory = 'Breaking Changes';
+      continue;
+    }
+    
+    // Add content to current category
+    if (trimmed.startsWith('- ') || trimmed.startsWith('* ') || trimmed.startsWith('+ ')) {
+      categories[currentCategory].push(trimmed.substring(2).trim());
+    } else if (trimmed && !trimmed.startsWith('#')) {
+      categories[currentCategory].push(trimmed);
+    }
+  }
+  
+  // Create formatted version
+  let formatted = '';
+  for (const [category, items] of Object.entries(categories)) {
+    if (items.length > 0) {
+      formatted += `**${category}:**\n`;
+      for (const item of items) {
+        formatted += `• ${item}\n`;
+      }
+      formatted += '\n';
+    }
+  }
+  
+  // Limit length if needed
+  const plainText = sanitized.replace(/[#*_`]/g, '');
+  if (plainText.length > UPDATE_CONSTANTS.MAX_RELEASE_NOTES_LENGTH) {
+    sanitized = plainText.substring(0, UPDATE_CONSTANTS.MAX_RELEASE_NOTES_LENGTH) + '...';
+    formatted = formatted.substring(0, UPDATE_CONSTANTS.MAX_RELEASE_NOTES_LENGTH) + '...';
+  }
+  
+  return {
+    plain: plainText || 'No release notes available.',
+    formatted: formatted || plainText || 'No release notes available.',
+    categories,
+    hasBreakingChanges: categories['Breaking Changes'].length > 0
+  };
+}
+
+// Update preferences management with error handling
+function getUpdatePreferences() {
+  try {
+    // Try localStorage first (for renderer process)
+    if (typeof localStorage !== 'undefined') {
+      const stored = localStorage.getItem(UPDATE_PREFERENCES_KEY);
+      if (stored) {
+        return { ...DEFAULT_UPDATE_PREFERENCES, ...JSON.parse(stored) };
+      }
+    }
+    
+    // Fallback to file-based storage (for main process)
+    const { app } = require('electron');
+    const prefsPath = path.join(app.getPath('userData'), 'update-preferences.json');
+    
+    if (fs.existsSync(prefsPath)) {
+      const stored = JSON.parse(fs.readFileSync(prefsPath, 'utf8'));
+      return { ...DEFAULT_UPDATE_PREFERENCES, ...stored };
+    }
+  } catch (error) {
+    logger.warn('Failed to load update preferences:', error);
+  }
+  return { ...DEFAULT_UPDATE_PREFERENCES };
+}
+
+function saveUpdatePreferences(preferences) {
+  try {
+    const current = getUpdatePreferences();
+    const updated = { ...current, ...preferences, lastUpdated: new Date().toISOString() };
+    
+    // Try localStorage first (for renderer process)
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(UPDATE_PREFERENCES_KEY, JSON.stringify(updated));
+    } else {
+      // Fallback to file-based storage (for main process)
+      const { app } = require('electron');
+      const prefsPath = path.join(app.getPath('userData'), 'update-preferences.json');
+      fs.writeFileSync(prefsPath, JSON.stringify(updated, null, 2));
+    }
+    
+    logger.info('Update preferences saved:', updated);
+    return updated;
+  } catch (error) {
+    logger.error('Failed to save update preferences:', error);
+    return null;
+  }
+}
+
+// Smart timing for update checks
+function isQuietTime(preferences = getUpdatePreferences()) {
+  if (!preferences.quietHours.enabled) return false;
+  
+  const now = new Date();
+  const currentTime = now.getHours() * 60 + now.getMinutes();
+  
+  const [startHour, startMin] = preferences.quietHours.start.split(':').map(Number);
+  const [endHour, endMin] = preferences.quietHours.end.split(':').map(Number);
+  
+  const startTime = startHour * 60 + startMin;
+  const endTime = endHour * 60 + endMin;
+  
+  if (startTime <= endTime) {
+    return currentTime >= startTime && currentTime <= endTime;
+  } else {
+    // Quiet hours span midnight
+    return currentTime >= startTime || currentTime <= endTime;
+  }
+}
+
+function shouldAutoCheck(preferences = getUpdatePreferences()) {
+  if (!preferences.autoCheck) return false;
+  if (isQuietTime(preferences)) return false;
+  
+  const lastCheck = preferences.lastAutoCheck ? new Date(preferences.lastAutoCheck) : null;
+  if (!lastCheck) return true;
+  
+  const now = new Date();
+  const timeDiff = now.getTime() - lastCheck.getTime();
+  
+  switch (preferences.checkFrequency) {
+    case 'daily':
+      return timeDiff >= 24 * 60 * 60 * 1000;
+    case 'weekly':
+      return timeDiff >= 7 * 24 * 60 * 60 * 1000;
+    case 'monthly':
+      return timeDiff >= 30 * 24 * 60 * 60 * 1000;
+    default:
+      return false;
+  }
+}
 
 // Robust version validation
 function validateVersion(version) {
@@ -95,7 +293,7 @@ class UpdateError extends Error {
   }
 }
 
-// Robust network request with retry logic
+// Robust network request with retry logic and progress tracking
 async function makeRobustRequest(url, options = {}) {
   if (!fetch) {
     throw new UpdateError('Network functionality not available', 'NO_FETCH', false);
@@ -160,8 +358,9 @@ async function makeRobustRequest(url, options = {}) {
         break;
       }
       
-      // Wait before retrying
-      await new Promise(resolve => setTimeout(resolve, UPDATE_CONSTANTS.RETRY_DELAY * attempt));
+      // Wait before retrying with exponential backoff
+      const delay = UPDATE_CONSTANTS.RETRY_DELAY * Math.pow(2, attempt - 1);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 
@@ -188,13 +387,159 @@ function validateReleaseData(release) {
   return true;
 }
 
-// Platform-specific update service with comprehensive error handling
-class PlatformUpdateService {
+// Enhanced platform-specific update service with comprehensive UX improvements
+class EnhancedPlatformUpdateService {
   constructor() {
     this.platform = process.platform;
     this.currentVersion = getSafeCurrentVersion();
     this.githubRepo = 'badboysm890/ClaraVerse';
     this.isChecking = false; // Prevent concurrent checks
+    this.downloadProgress = null; // Track download progress
+    this.backgroundDownload = null; // Background download state
+    this.notificationCallbacks = new Set(); // UI notification callbacks
+    this.preferences = getUpdatePreferences();
+    this.autoCheckTimer = null;
+    
+    // Initialize background checking if enabled
+    this.initializeAutoCheck();
+  }
+
+  /**
+   * Initialize automatic update checking
+   */
+  initializeAutoCheck() {
+    // Clear any existing timer
+    if (this.autoCheckTimer) {
+      clearTimeout(this.autoCheckTimer);
+    }
+    
+    const preferences = getUpdatePreferences();
+    
+    if (preferences.autoCheck) {
+      // Check on startup (delayed)
+      this.autoCheckTimer = setTimeout(() => {
+        this.performBackgroundCheck();
+      }, UPDATE_CONSTANTS.AUTO_CHECK_STARTUP_DELAY);
+      
+      // Set up periodic checks
+      setInterval(() => {
+        if (shouldAutoCheck()) {
+          this.performBackgroundCheck();
+        }
+      }, UPDATE_CONSTANTS.BACKGROUND_CHECK_INTERVAL);
+    }
+  }
+
+  /**
+   * Perform background update check
+   */
+  async performBackgroundCheck() {
+    try {
+      const preferences = getUpdatePreferences();
+      
+      if (!preferences.autoCheck || isQuietTime(preferences)) {
+        return;
+      }
+      
+      logger.info('Performing background update check...');
+      
+      const updateInfo = await this.checkGitHubReleases();
+      
+      // Update last check time
+      saveUpdatePreferences({ lastAutoCheck: new Date().toISOString() });
+      
+      if (updateInfo.hasUpdate && preferences.notifyOnAvailable) {
+        // Check if this version was dismissed
+        if (!preferences.dismissedVersions.includes(updateInfo.latestVersion)) {
+          this.notify('update-available', updateInfo);
+          
+          // Show native notification if supported
+          this.showNativeNotification(updateInfo);
+        }
+      }
+      
+      logger.info('Background update check completed:', {
+        hasUpdate: updateInfo.hasUpdate,
+        version: updateInfo.latestVersion
+      });
+      
+    } catch (error) {
+      logger.error('Background update check failed:', error);
+    }
+  }
+
+  /**
+   * Show native system notification
+   */
+  showNativeNotification(updateInfo) {
+    try {
+      const { Notification } = require('electron');
+      
+      if (Notification.isSupported()) {
+        const notification = new Notification({
+          title: `Clara ${updateInfo.latestVersion} Available`,
+          body: `A new version of Clara is ready to download. Click to view details.`,
+          icon: path.join(__dirname, '../assets/icons/icon.png'), // Adjust path as needed
+          silent: false
+        });
+        
+        notification.on('click', () => {
+          // Open settings to updates tab
+          const windows = BrowserWindow.getAllWindows();
+          if (windows.length > 0) {
+            const mainWindow = windows[0];
+            mainWindow.show();
+            mainWindow.webContents.send('navigate-to-updates');
+          }
+        });
+        
+        notification.show();
+      }
+    } catch (error) {
+      logger.warn('Failed to show native notification:', error);
+    }
+  }
+
+  /**
+   * Register callback for update notifications
+   */
+  onNotification(callback) {
+    this.notificationCallbacks.add(callback);
+    return () => this.notificationCallbacks.delete(callback);
+  }
+
+  /**
+   * Send notification to all registered callbacks
+   */
+  notify(type, data) {
+    for (const callback of this.notificationCallbacks) {
+      try {
+        callback(type, data);
+      } catch (error) {
+        logger.error('Error in notification callback:', error);
+      }
+    }
+  }
+
+  /**
+   * Update preferences and reinitialize if needed
+   */
+  updatePreferences(newPreferences) {
+    const updated = saveUpdatePreferences(newPreferences);
+    if (updated) {
+      this.preferences = updated;
+      this.initializeAutoCheck(); // Reinitialize with new settings
+    }
+    return updated;
+  }
+
+  /**
+   * Dismiss a specific version (user chose to skip)
+   */
+  dismissVersion(version) {
+    const preferences = getUpdatePreferences();
+    const dismissedVersions = [...preferences.dismissedVersions, version];
+    return this.updatePreferences({ dismissedVersions });
   }
 
   /**
@@ -206,7 +551,7 @@ class PlatformUpdateService {
   }
 
   /**
-   * Safe GitHub releases check with comprehensive validation
+   * Safe GitHub releases check with comprehensive validation and enhanced UX
    */
   async checkGitHubReleases() {
     // Prevent concurrent update checks
@@ -215,13 +560,47 @@ class PlatformUpdateService {
     }
 
     this.isChecking = true;
+    this.notify('check-started', { timestamp: new Date() });
 
     try {
-      const url = `https://api.github.com/repos/${this.githubRepo}/releases/latest`;
-      logger.info(`Checking for updates at: ${url}`);
+      const preferences = getUpdatePreferences();
+      
+      // Determine which endpoint to use based on beta channel preference
+      let url;
+      if (preferences.betaChannel) {
+        // For beta channel, get all releases and find the latest (including pre-releases)
+        url = `https://api.github.com/repos/${this.githubRepo}/releases`;
+        logger.info(`Checking for beta updates (including pre-releases) at: ${url}`);
+      } else {
+        // For stable channel, get only the latest stable release
+        url = `https://api.github.com/repos/${this.githubRepo}/releases/latest`;
+        logger.info(`Checking for stable updates at: ${url}`);
+      }
       
       const response = await makeRobustRequest(url);
-      const release = await response.json();
+      
+      let release;
+      if (preferences.betaChannel) {
+        // Get all releases and find the latest one (including pre-releases)
+        const releases = await response.json();
+        if (!Array.isArray(releases) || releases.length === 0) {
+          throw new UpdateError('No releases found in repository', 'NO_RELEASES', false);
+        }
+        
+        // Sort releases by published date (newest first) and take the first one
+        release = releases
+          .filter(r => r && r.tag_name && r.published_at)
+          .sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime())[0];
+          
+        if (!release) {
+          throw new UpdateError('No valid releases found', 'NO_VALID_RELEASES', false);
+        }
+        
+        logger.info(`Found latest release (beta channel): ${release.tag_name}${release.prerelease ? ' (pre-release)' : ''}`);
+      } else {
+        // For stable channel, use the single latest stable release
+        release = await response.json();
+      }
       
       // Validate release data structure
       validateReleaseData(release);
@@ -229,25 +608,49 @@ class PlatformUpdateService {
       const latestVersion = validateVersion(release.tag_name);
       const hasUpdate = this.isVersionNewer(latestVersion, this.currentVersion);
       
+      // Enhanced release notes processing
+      const processedNotes = processReleaseNotes(release.body);
+      
       const updateInfo = {
         hasUpdate,
         latestVersion,
         currentVersion: this.currentVersion,
         releaseUrl: release.html_url,
         downloadUrl: this.getDownloadUrlForPlatform(release.assets),
-        releaseNotes: this.sanitizeReleaseNotes(release.body),
-        publishedAt: release.published_at
+        releaseNotes: processedNotes.plain,
+        releaseNotesFormatted: processedNotes.formatted,
+        releaseNotesCategories: processedNotes.categories,
+        hasBreakingChanges: processedNotes.hasBreakingChanges,
+        publishedAt: release.published_at,
+        assetSize: this.getAssetSize(release.assets),
+        downloadEstimate: this.estimateDownloadTime(release.assets),
+        assets: release.assets, // Include assets for download handling
+        isPrerelease: release.prerelease || false, // Include pre-release status
+        isBetaChannel: preferences.betaChannel // Include beta channel status
       };
       
       logger.info('Update check completed successfully:', {
         hasUpdate,
         currentVersion: this.currentVersion,
-        latestVersion
+        latestVersion,
+        hasBreakingChanges: processedNotes.hasBreakingChanges
       });
       
+      this.notify('check-completed', updateInfo);
       return updateInfo;
+      
     } catch (error) {
       logger.error('Error checking GitHub releases:', error);
+      
+      const errorInfo = {
+        hasUpdate: false,
+        error: error instanceof UpdateError ? error.message : `Failed to check for updates: ${error.message}`,
+        currentVersion: this.currentVersion,
+        platform: this.platform,
+        isOTASupported: this.isOTASupported()
+      };
+      
+      this.notify('check-failed', errorInfo);
       
       if (error instanceof UpdateError) {
         throw error;
@@ -264,24 +667,81 @@ class PlatformUpdateService {
   }
 
   /**
-   * Sanitize release notes to prevent XSS and limit length
+   * Get asset size for download estimation
    */
-  sanitizeReleaseNotes(notes) {
-    if (!notes || typeof notes !== 'string') {
-      return 'No release notes available.';
+  getAssetSize(assets) {
+    if (!Array.isArray(assets)) return null;
+    
+    const platformAsset = this.findPlatformAsset(assets);
+    if (platformAsset && platformAsset.size) {
+      return this.formatFileSize(platformAsset.size);
     }
     
-    // Basic sanitization - remove HTML tags and limit length
-    const sanitized = notes
-      .replace(/<[^>]*>/g, '') // Remove HTML tags
-      .replace(/[<>&"']/g, '') // Remove potential XSS characters
-      .trim();
+    return null;
+  }
+
+  /**
+   * Estimate download time based on asset size
+   */
+  estimateDownloadTime(assets) {
+    if (!Array.isArray(assets)) return null;
     
-    if (sanitized.length > UPDATE_CONSTANTS.MAX_RELEASE_NOTES_LENGTH) {
-      return sanitized.substring(0, UPDATE_CONSTANTS.MAX_RELEASE_NOTES_LENGTH) + '...';
+    const platformAsset = this.findPlatformAsset(assets);
+    if (platformAsset && platformAsset.size) {
+      // Assume average download speed of 10 Mbps (conservative estimate)
+      const avgSpeedBytesPerSecond = (10 * 1024 * 1024) / 8; // 10 Mbps to bytes/sec
+      const estimatedSeconds = platformAsset.size / avgSpeedBytesPerSecond;
+      
+      if (estimatedSeconds < 60) {
+        return `< 1 minute`;
+      } else if (estimatedSeconds < 3600) {
+        return `~ ${Math.ceil(estimatedSeconds / 60)} minutes`;
+      } else {
+        return `~ ${Math.ceil(estimatedSeconds / 3600)} hours`;
+      }
     }
     
-    return sanitized || 'No release notes available.';
+    return null;
+  }
+
+  /**
+   * Find platform-specific asset
+   */
+  findPlatformAsset(assets) {
+    const platformExtensions = {
+      darwin: ['.dmg', '-arm64.dmg', '-mac.dmg'],
+      win32: ['.exe', '-win.exe', '-windows.exe'],
+      linux: ['.AppImage', '.deb', '-linux.AppImage']
+    };
+
+    const extensions = platformExtensions[this.platform] || [];
+    
+    for (const ext of extensions) {
+      const asset = assets.find(asset => 
+        asset && 
+        asset.name && 
+        typeof asset.name === 'string' && 
+        asset.name.toLowerCase().endsWith(ext.toLowerCase()) &&
+        asset.browser_download_url
+      );
+      
+      if (asset) {
+        return asset;
+      }
+    }
+    
+    return null;
+  }
+
+  /**
+   * Format file size in human readable format
+   */
+  formatFileSize(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   }
 
   /**
@@ -293,28 +753,11 @@ class PlatformUpdateService {
       return `https://github.com/${this.githubRepo}/releases/latest`;
     }
 
-    const platformExtensions = {
-      darwin: ['.dmg', '-arm64.dmg', '-mac.dmg'],
-      win32: ['.exe', '-win.exe', '-windows.exe'],
-      linux: ['.AppImage', '.deb', '-linux.AppImage']
-    };
-
-    const extensions = platformExtensions[this.platform] || [];
+    const platformAsset = this.findPlatformAsset(assets);
     
-    // Try to find platform-specific download
-    for (const ext of extensions) {
-      const asset = assets.find(asset => 
-        asset && 
-        asset.name && 
-        typeof asset.name === 'string' && 
-        asset.name.toLowerCase().endsWith(ext.toLowerCase()) &&
-        asset.browser_download_url
-      );
-      
-      if (asset) {
-        logger.info(`Found platform-specific download: ${asset.name}`);
-        return asset.browser_download_url;
-      }
+    if (platformAsset) {
+      logger.info(`Found platform-specific download: ${platformAsset.name}`);
+      return platformAsset.browser_download_url;
     }
 
     // Fallback to releases page
@@ -361,78 +804,314 @@ class PlatformUpdateService {
   }
 
   /**
-   * Show platform-specific update dialog with error handling
+   * Start in-app download from UI (called from renderer process)
    */
-  async showUpdateDialog(updateInfo) {
+  async startInAppDownload(updateInfo) {
     try {
-      const { hasUpdate, latestVersion, downloadUrl, releaseNotes } = updateInfo;
+      if (!updateInfo || !updateInfo.downloadUrl) {
+        throw new Error('Invalid update info or download URL');
+      }
+
+      const asset = this.findPlatformAsset(updateInfo.assets || []);
+      const fileName = asset ? asset.name : `Clara-${updateInfo.latestVersion}-${this.platform}.${this.platform === 'win32' ? 'exe' : 'AppImage'}`;
+      
+      logger.info(`Starting in-app download for: ${fileName}`);
+      
+      // Start download and return promise
+      const filePath = await this.downloadUpdateFile(updateInfo.downloadUrl, fileName);
+      
+      return {
+        success: true,
+        filePath,
+        fileName
+      };
+      
+    } catch (error) {
+      logger.error('Error starting in-app download:', error);
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Download update file with progress tracking
+   */
+  async downloadUpdateFile(downloadUrl, fileName) {
+    try {
+      this.notify('download-started', { 
+        fileName,
+        timestamp: new Date() 
+      });
+
+      const { app, BrowserWindow } = require('electron');
+      const downloadsPath = app.getPath('downloads');
+      const filePath = path.join(downloadsPath, fileName);
+      
+      // Make sure downloads directory exists
+      if (!fs.existsSync(downloadsPath)) {
+        fs.mkdirSync(downloadsPath, { recursive: true });
+      }
+      
+      logger.info(`Starting download: ${downloadUrl} -> ${filePath}`);
+      
+      const response = await makeRobustRequest(downloadUrl);
+      const totalSize = parseInt(response.headers.get('content-length') || '0');
+      
+      let downloadedSize = 0;
+      const fileStream = fs.createWriteStream(filePath);
+      
+      // Track download progress
+      const reader = response.body.getReader();
+      
+      // Send progress updates to all renderer processes
+      const sendProgressUpdate = (progress) => {
+        this.notify('download-progress', progress);
+        
+        // Also send to main window if available
+        const windows = BrowserWindow.getAllWindows();
+        windows.forEach(window => {
+          if (window && window.webContents) {
+            window.webContents.send('update-download-progress', progress);
+          }
+        });
+      };
+      
+      const pump = async () => {
+        return reader.read().then(({ done, value }) => {
+          if (done) {
+            fileStream.end();
+            return;
+          }
+          
+          downloadedSize += value.length;
+          fileStream.write(value);
+          
+          // Send progress update
+          const progress = {
+            percent: totalSize > 0 ? Math.round((downloadedSize / totalSize) * 100) : 0,
+            transferred: this.formatFileSize(downloadedSize),
+            total: this.formatFileSize(totalSize),
+            fileName
+          };
+          
+          sendProgressUpdate(progress);
+          
+          return pump();
+        });
+      };
+      
+      await pump();
+      
+      // Verify file was downloaded successfully
+      if (!fs.existsSync(filePath)) {
+        throw new Error('Download completed but file not found');
+      }
+      
+      const fileStats = fs.statSync(filePath);
+      if (fileStats.size === 0) {
+        throw new Error('Downloaded file is empty');
+      }
+      
+      logger.info(`Download completed: ${filePath} (${this.formatFileSize(fileStats.size)})`);
+      
+      this.notify('download-completed', { 
+        filePath,
+        fileName,
+        fileSize: this.formatFileSize(fileStats.size),
+        timestamp: new Date()
+      });
+      
+      return filePath;
+      
+    } catch (error) {
+      logger.error('Download failed:', error);
+      this.notify('download-error', { 
+        error: error.message,
+        fileName,
+        timestamp: new Date()
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Enhanced platform-specific update dialog with beautiful UX and in-app downloading
+   */
+  async showEnhancedUpdateDialog(updateInfo) {
+    try {
+      const { hasUpdate, latestVersion, downloadUrl, releaseNotesFormatted, hasBreakingChanges } = updateInfo;
 
       if (!hasUpdate) {
         return await dialog.showMessageBox({
           type: 'info',
-          title: 'No Updates Available',
-          message: 'You are running the latest version of Clara.',
-          detail: `Current version: ${this.currentVersion}`,
-          buttons: ['OK'],
+          title: '✅ You\'re Up to Date!',
+          message: 'Clara is current',
+          detail: `You're running Clara ${this.currentVersion}, which is the latest version available.`,
+          buttons: ['Perfect!'],
           defaultId: 0
         });
       }
 
-      const truncatedNotes = releaseNotes && releaseNotes.length > 200 
-        ? releaseNotes.substring(0, 200) + '...' 
-        : releaseNotes;
+      // Build enhanced message with categorized release notes
+      let detailMessage = `Current version: Clara ${this.currentVersion}\nNew version: Clara ${latestVersion}`;
+      
+      // Indicate if this is a pre-release version
+      if (updateInfo.isPrerelease) {
+        detailMessage += ` (Beta/Pre-release)`;
+      }
+      detailMessage += '\n\n';
+      
+      if (updateInfo.isPrerelease) {
+        detailMessage += `🧪 This is a beta/pre-release version. It may contain experimental features and bugs.\n\n`;
+      }
+      
+      if (hasBreakingChanges) {
+        detailMessage += `⚠️ This update contains breaking changes. Please review the release notes.\n\n`;
+      }
+      
+      if (updateInfo.assetSize) {
+        detailMessage += `Download size: ${updateInfo.assetSize}`;
+        if (updateInfo.downloadEstimate) {
+          detailMessage += ` (${updateInfo.downloadEstimate})`;
+        }
+        detailMessage += '\n\n';
+      }
+
+      if (releaseNotesFormatted && releaseNotesFormatted !== 'No release notes available.') {
+        const truncated = releaseNotesFormatted.length > 400 
+          ? releaseNotesFormatted.substring(0, 400) + '...\n\nClick "Release Notes" for full details.' 
+          : releaseNotesFormatted;
+        detailMessage += `What's new:\n${truncated}`;
+      }
 
       if (this.isOTASupported()) {
-        // Mac: Show OTA update dialog
+        // Mac: Enhanced OTA update dialog
+        const dialogTitle = updateInfo.isPrerelease 
+          ? (hasBreakingChanges ? '⚠️ Important Beta Update Available' : '🧪 Beta Update Available')
+          : (hasBreakingChanges ? '⚠️ Important Update Available' : '🎉 Update Available');
+          
+        const dialogMessage = updateInfo.isPrerelease
+          ? `Clara ${latestVersion} Beta is ready to install`
+          : `Clara ${latestVersion} is ready to install`;
+          
         return await dialog.showMessageBox({
           type: 'info',
-          title: 'Update Available',
-          message: `Clara ${latestVersion} is available`,
-          detail: `You have ${this.currentVersion}. Would you like to download and install the update automatically?\n\n${truncatedNotes ? `What's new:\n${truncatedNotes}` : 'Click "View Release Notes" for details.'}`,
-          buttons: ['Download & Install', 'View Release Notes', 'Later'],
+          title: dialogTitle,
+          message: dialogMessage,
+          detail: detailMessage,
+          buttons: ['Download & Install Now', 'View Release Notes', 'Remind Me Later', 'Skip This Version'],
           defaultId: 0,
           cancelId: 2
         }).then(({ response }) => {
           try {
-            if (response === 0) {
-              // Start OTA update
-              autoUpdater.downloadUpdate();
-              return { action: 'download' };
-            } else if (response === 1) {
-              // Open release notes
-              shell.openExternal(updateInfo.releaseUrl);
-              return { action: 'view_notes' };
+            switch (response) {
+              case 0:
+                // Start OTA update with progress tracking
+                this.startOTAUpdateWithProgress();
+                return { action: 'download' };
+              case 1:
+                // Open release notes
+                shell.openExternal(updateInfo.releaseUrl);
+                return { action: 'view_notes' };
+              case 2:
+                return { action: 'later' };
+              case 3:
+                // Skip this version
+                this.dismissVersion(latestVersion);
+                return { action: 'dismissed' };
+              default:
+                return { action: 'later' };
             }
-            return { action: 'later' };
           } catch (error) {
             logger.error('Error handling dialog response:', error);
             return { action: 'error', error: error.message };
           }
         });
       } else {
-        // Windows/Linux: Show manual update dialog
+        // Windows/Linux: Enhanced in-app download dialog
         const platformName = this.platform === 'win32' ? 'Windows' : 'Linux';
+        
+        detailMessage += `\n🔒 On ${platformName}, updates are installed manually for security. The file will be downloaded to your Downloads folder and opened automatically.`;
+        
+        const dialogTitle = updateInfo.isPrerelease 
+          ? (hasBreakingChanges ? '⚠️ Important Beta Update Available' : '🧪 Beta Update Available')
+          : (hasBreakingChanges ? '⚠️ Important Update Available' : '📦 Update Available');
+          
+        const dialogMessage = updateInfo.isPrerelease
+          ? `Clara ${latestVersion} Beta is ready to download`
+          : `Clara ${latestVersion} is ready to download`;
         
         return await dialog.showMessageBox({
           type: 'info',
-          title: 'Update Available',
-          message: `Clara ${latestVersion} is available`,
-          detail: `You have ${this.currentVersion}. A new version is available for download.\n\nOn ${platformName}, updates need to be installed manually for security reasons.\n\n${truncatedNotes ? `What's new:\n${truncatedNotes}` : 'Click "View Release Notes" for details.'}`,
-          buttons: ['Download Now', 'View Release Notes', 'Later'],
+          title: dialogTitle,
+          message: dialogMessage,
+          detail: detailMessage,
+          buttons: ['Download Now', 'View Release Notes', 'Remind Me Later', 'Skip This Version'],
           defaultId: 0,
           cancelId: 2
-        }).then(({ response }) => {
+        }).then(async ({ response }) => {
           try {
-            if (response === 0) {
-              // Open download page
-              shell.openExternal(downloadUrl);
-              return { action: 'download' };
-            } else if (response === 1) {
-              // Open release notes
-              shell.openExternal(updateInfo.releaseUrl);
-              return { action: 'view_notes' };
+            switch (response) {
+              case 0:
+                // Start in-app download with progress tracking
+                try {
+                  const asset = this.findPlatformAsset(updateInfo.assets || []);
+                  const fileName = asset ? asset.name : `Clara-${latestVersion}-${this.platform}.${this.platform === 'win32' ? 'exe' : 'AppImage'}`;
+                  
+                  // Start download in background
+                  this.downloadUpdateFile(downloadUrl, fileName).then((filePath) => {
+                    // Show completion dialog and offer to open
+                    dialog.showMessageBox({
+                      type: 'info',
+                      title: '✅ Download Complete!',
+                      message: `Clara ${latestVersion} has been downloaded`,
+                      detail: `The installer has been saved to:\n${filePath}\n\nWould you like to open it now?`,
+                      buttons: ['Open Installer', 'Open Downloads Folder', 'Later'],
+                      defaultId: 0
+                    }).then(({ response: openResponse }) => {
+                      try {
+                        if (openResponse === 0) {
+                          // Open the installer
+                          shell.openPath(filePath);
+                        } else if (openResponse === 1) {
+                          // Open downloads folder
+                          shell.showItemInFolder(filePath);
+                        }
+                      } catch (error) {
+                        logger.error('Error opening downloaded file:', error);
+                      }
+                    });
+                  }).catch((error) => {
+                    // Show download error dialog
+                    dialog.showErrorBox(
+                      '❌ Download Failed', 
+                      `Failed to download update: ${error.message}\n\nYou can manually download from:\n${updateInfo.releaseUrl}`
+                    );
+                  });
+                  
+                  return { action: 'download' };
+                } catch (error) {
+                  logger.error('Error starting download:', error);
+                  // Fallback to browser download
+                  shell.openExternal(downloadUrl);
+                  return { action: 'download_fallback' };
+                }
+              case 1:
+                // Open release notes
+                shell.openExternal(updateInfo.releaseUrl);
+                return { action: 'view_notes' };
+              case 2:
+                return { action: 'later' };
+              case 3:
+                // Skip this version
+                this.dismissVersion(latestVersion);
+                return { action: 'dismissed' };
+              default:
+                return { action: 'later' };
             }
-            return { action: 'later' };
           } catch (error) {
             logger.error('Error handling dialog response:', error);
             return { action: 'error', error: error.message };
@@ -440,13 +1119,13 @@ class PlatformUpdateService {
         });
       }
     } catch (error) {
-      logger.error('Error showing update dialog:', error);
+      logger.error('Error showing enhanced update dialog:', error);
       
       // Show fallback error dialog
       try {
         await dialog.showErrorBox(
-          'Update Dialog Error',
-          `Failed to show update information: ${error.message}`
+          '❌ Update Dialog Error',
+          `Failed to show update information: ${error.message}\n\nPlease check for updates manually at: https://github.com/${this.githubRepo}/releases`
         );
       } catch (dialogError) {
         logger.error('Failed to show error dialog:', dialogError);
@@ -455,77 +1134,99 @@ class PlatformUpdateService {
       return { action: 'error', error: error.message };
     }
   }
+
+  /**
+   * Start OTA update with progress tracking
+   */
+  startOTAUpdateWithProgress() {
+    try {
+      this.notify('download-started', { timestamp: new Date() });
+      autoUpdater.downloadUpdate();
+    } catch (error) {
+      logger.error('Failed to start OTA update:', error);
+      this.notify('download-error', { error: error.message });
+    }
+  }
 }
 
-// Global instance with error protection
-let platformUpdateService;
+// Create enhanced global instance with error protection
+let enhancedPlatformUpdateService;
 try {
-  platformUpdateService = new PlatformUpdateService();
+  enhancedPlatformUpdateService = new EnhancedPlatformUpdateService();
 } catch (error) {
-  logger.error('Failed to initialize update service:', error);
-  platformUpdateService = null;
+  logger.error('Failed to initialize enhanced update service:', error);
+  enhancedPlatformUpdateService = null;
 }
 
-// Enhanced auto-updater setup with comprehensive error handling
-function setupAutoUpdater(mainWindow) {
-  if (!platformUpdateService || !platformUpdateService.isOTASupported()) {
+// Enhanced auto-updater setup with comprehensive error handling and progress tracking
+function setupEnhancedAutoUpdater(mainWindow) {
+  if (!enhancedPlatformUpdateService || !enhancedPlatformUpdateService.isOTASupported()) {
     logger.info('OTA updates not supported on this platform');
     return;
   }
 
   try {
-    // Check for updates when the app starts (Mac only)
-    autoUpdater.checkForUpdatesAndNotify().catch(error => {
-      logger.error('Initial update check failed:', error);
+    // Enhanced progress tracking
+    autoUpdater.on('download-progress', (progressObj) => {
+      try {
+        const progress = {
+          percent: Math.round(progressObj.percent),
+          transferred: enhancedPlatformUpdateService.formatFileSize(progressObj.transferred),
+          total: enhancedPlatformUpdateService.formatFileSize(progressObj.total),
+          bytesPerSecond: enhancedPlatformUpdateService.formatFileSize(progressObj.bytesPerSecond) + '/s'
+        };
+        
+        enhancedPlatformUpdateService.notify('download-progress', progress);
+        
+        if (mainWindow && mainWindow.webContents) {
+          mainWindow.webContents.send('update-download-progress', progress);
+        }
+      } catch (error) {
+        logger.error('Error processing download progress:', error);
+      }
     });
 
-    // Check for updates every hour (Mac only) with error handling
-    setInterval(() => {
-      autoUpdater.checkForUpdatesAndNotify().catch(error => {
-        logger.error('Periodic update check failed:', error);
-      });
-    }, 60 * 60 * 1000);
-
-    // Update available
-    autoUpdater.on('update-available', (info) => {
+    // Update available with enhanced dialog
+    autoUpdater.on('update-available', async (info) => {
       try {
-        dialog.showMessageBox({
-          type: 'info',
-          title: 'Update Available',
-          message: `A new version (${info.version}) is available. Would you like to download and update now?`,
-          buttons: ['Update', 'Later'],
-          defaultId: 0,
-          cancelId: 1
-        }).then(({ response }) => {
-          if (response === 0) {
-            autoUpdater.downloadUpdate().catch(error => {
-              logger.error('Download update failed:', error);
-              dialog.showErrorBox('Download Failed', `Failed to download update: ${error.message}`);
-            });
-          }
-        }).catch(error => {
-          logger.error('Error showing update available dialog:', error);
-        });
+        logger.info('OTA update available:', info);
+        
+        const updateInfo = {
+          hasUpdate: true,
+          latestVersion: info.version,
+          currentVersion: enhancedPlatformUpdateService.currentVersion,
+          releaseNotes: info.releaseNotes || 'Release notes not available',
+          publishedAt: info.releaseDate
+        };
+        
+        enhancedPlatformUpdateService.notify('update-available', updateInfo);
+        
       } catch (error) {
         logger.error('Error in update-available handler:', error);
       }
     });
 
-    // Update downloaded
+    // Update downloaded with enhanced dialog
     autoUpdater.on('update-downloaded', () => {
       try {
+        enhancedPlatformUpdateService.notify('download-completed', { timestamp: new Date() });
+        
         dialog.showMessageBox({
           type: 'info',
-          title: 'Update Ready',
-          message: 'The update has been downloaded. The application will restart to apply the update.',
-          buttons: ['Restart Now'],
-          defaultId: 0
-        }).then(() => {
-          try {
-            autoUpdater.quitAndInstall();
-          } catch (error) {
-            logger.error('Error during quit and install:', error);
-            dialog.showErrorBox('Installation Failed', `Failed to install update: ${error.message}`);
+          title: '🎉 Update Ready!',
+          message: 'Clara has been updated successfully',
+          detail: 'The update has been downloaded and verified. Clara will restart to complete the installation.',
+          buttons: ['Restart Now', 'Restart Later'],
+          defaultId: 0,
+          cancelId: 1
+        }).then(({ response }) => {
+          if (response === 0) {
+            try {
+              autoUpdater.quitAndInstall();
+            } catch (error) {
+              logger.error('Error during quit and install:', error);
+              dialog.showErrorBox('Installation Failed', `Failed to install update: ${error.message}`);
+            }
           }
         }).catch(error => {
           logger.error('Error showing update downloaded dialog:', error);
@@ -539,79 +1240,63 @@ function setupAutoUpdater(mainWindow) {
     autoUpdater.on('error', (err) => {
       logger.error('Auto-updater error:', err);
       
+      enhancedPlatformUpdateService.notify('download-error', { error: err.message });
+      
       try {
         // Fallback to GitHub-based updates on error
-        dialog.showErrorBox('Update Error', 
-          `Automatic update failed: ${err.message}\n\nYou can manually download the latest version from GitHub.`
+        dialog.showErrorBox('❌ Update Error', 
+          `Automatic update failed: ${err.message}\n\nYou can manually download the latest version from:\nhttps://github.com/${enhancedPlatformUpdateService.githubRepo}/releases`
         );
       } catch (dialogError) {
         logger.error('Failed to show error dialog:', dialogError);
       }
     });
 
-    // Progress updates with error handling
-    autoUpdater.on('download-progress', (progressObj) => {
-      try {
-        if (mainWindow && mainWindow.webContents) {
-          mainWindow.webContents.send('update-progress', progressObj);
-        }
-      } catch (error) {
-        logger.error('Error sending progress update:', error);
-      }
-    });
-
     // No update available
-    autoUpdater.on('update-not-available', (info, isManualCheck) => {
+    autoUpdater.on('update-not-available', (info) => {
       try {
-        if (isManualCheck) {
-          dialog.showMessageBox({
-            type: 'info',
-            title: 'No Updates Available',
-            message: 'You are running the latest version of Clara.',
-            buttons: ['OK'],
-            defaultId: 0
-          }).catch(error => {
-            logger.error('Error showing no update dialog:', error);
-          });
-        }
+        enhancedPlatformUpdateService.notify('no-update-available', { 
+          currentVersion: enhancedPlatformUpdateService.currentVersion,
+          timestamp: new Date()
+        });
       } catch (error) {
         logger.error('Error in update-not-available handler:', error);
       }
     });
 
-    logger.info('Auto-updater setup completed successfully');
+    logger.info('Enhanced auto-updater setup completed successfully');
   } catch (error) {
-    logger.error('Failed to setup auto-updater:', error);
+    logger.error('Failed to setup enhanced auto-updater:', error);
   }
 }
 
-// Universal update check with comprehensive error handling
-async function checkForUpdates() {
-  if (!platformUpdateService) {
-    const error = 'Update service not available';
+// Enhanced universal update check with comprehensive error handling
+async function checkForUpdatesEnhanced() {
+  if (!enhancedPlatformUpdateService) {
+    const error = 'Enhanced update service not available';
     logger.error(error);
     try {
       dialog.showErrorBox('Update Service Error', error);
     } catch (dialogError) {
       logger.error('Failed to show error dialog:', dialogError);
     }
-    return;
+    return null;
   }
 
   try {
-    if (platformUpdateService.isOTASupported()) {
+    if (enhancedPlatformUpdateService.isOTASupported()) {
       // Mac: Use electron-updater first, fallback to GitHub
       try {
         return await autoUpdater.checkForUpdates();
       } catch (error) {
         logger.warn('OTA update check failed, falling back to GitHub:', error);
-        const updateInfo = await platformUpdateService.checkGitHubReleases();
-        return await platformUpdateService.showUpdateDialog(updateInfo);
+        const updateInfo = await enhancedPlatformUpdateService.checkGitHubReleases();
+        return await enhancedPlatformUpdateService.showEnhancedUpdateDialog(updateInfo);
       }
     } else {
-      // Windows/Linux: Use GitHub releases
-      const updateInfo = await platformUpdateService.checkGitHubReleases();
-      return await platformUpdateService.showUpdateDialog(updateInfo);
+      // Windows/Linux: Use enhanced GitHub releases
+      const updateInfo = await enhancedPlatformUpdateService.checkGitHubReleases();
+      return await enhancedPlatformUpdateService.showEnhancedUpdateDialog(updateInfo);
     }
   } catch (error) {
     logger.error('Error checking for updates:', error);
@@ -635,34 +1320,42 @@ async function checkForUpdates() {
     }
     
     try {
-      dialog.showErrorBox('Update Check Failed', userMessage);
+      dialog.showErrorBox('❌ Update Check Failed', userMessage);
     } catch (dialogError) {
       logger.error('Failed to show error dialog:', dialogError);
     }
+    
+    return null;
   }
 }
 
-// Safe update info retrieval for UI
-async function getUpdateInfo() {
-  if (!platformUpdateService) {
+// Enhanced update info retrieval for UI with comprehensive data
+async function getEnhancedUpdateInfo() {
+  if (!enhancedPlatformUpdateService) {
     return {
       hasUpdate: false,
-      error: 'Update service not available',
+      error: 'Enhanced update service not available',
       platform: process.platform,
       isOTASupported: false,
-      currentVersion: getSafeCurrentVersion()
+      currentVersion: getSafeCurrentVersion(),
+      preferences: DEFAULT_UPDATE_PREFERENCES
     };
   }
 
   try {
-    const updateInfo = await platformUpdateService.checkGitHubReleases();
+    const updateInfo = await enhancedPlatformUpdateService.checkGitHubReleases();
+    const preferences = getUpdatePreferences();
+    
     return {
       ...updateInfo,
-      platform: platformUpdateService.platform,
-      isOTASupported: platformUpdateService.isOTASupported()
+      platform: enhancedPlatformUpdateService.platform,
+      isOTASupported: enhancedPlatformUpdateService.isOTASupported(),
+      preferences,
+      lastAutoCheck: preferences.lastAutoCheck,
+      dismissedVersions: preferences.dismissedVersions
     };
   } catch (error) {
-    logger.error('Error getting update info:', error);
+    logger.error('Error getting enhanced update info:', error);
     
     let errorMessage = 'Failed to check for updates';
     
@@ -675,1022 +1368,29 @@ async function getUpdateInfo() {
     return {
       hasUpdate: false,
       error: errorMessage,
-      platform: platformUpdateService.platform,
-      isOTASupported: platformUpdateService.isOTASupported(),
-      currentVersion: platformUpdateService.currentVersion
+      platform: enhancedPlatformUpdateService.platform,
+      isOTASupported: enhancedPlatformUpdateService.isOTASupported(),
+      currentVersion: enhancedPlatformUpdateService.currentVersion,
+      preferences: getUpdatePreferences()
     };
   }
 }
 
-// Llama.cpp Binary Update Service
-class LlamacppUpdateService {
-  constructor() {
-    this.platform = process.platform;
-    this.arch = process.arch;
-    this.githubRepo = 'ggerganov/llama.cpp';
-    this.isUpdating = false;
-    this.binariesPath = this.getBinariesPath();
-  }
-
-  getBinariesPath() {
-    const path = require('path');
-    const { app } = require('electron');
-    
-    const isDevelopment = process.env.NODE_ENV === 'development';
-    
-    if (isDevelopment) {
-      return path.join(__dirname, 'llamacpp-binaries');
-    } else {
-      // Production paths
-      const possiblePaths = [
-        path.join(process.resourcesPath, 'electron', 'llamacpp-binaries'),
-        path.join(app.getAppPath(), 'electron', 'llamacpp-binaries'),
-        path.join(__dirname, 'llamacpp-binaries')
-      ];
-      
-      for (const possiblePath of possiblePaths) {
-        if (require('fs').existsSync(possiblePath)) {
-          return possiblePath;
-        }
-      }
-      
-      return path.join(app.getPath('userData'), 'llamacpp-binaries');
-    }
-  }
-
-  getCurrentVersion() {
-    const path = require('path');
-    const fs = require('fs');
-    
-    try {
-      const versionFile = path.join(this.binariesPath, 'version.txt');
-      if (fs.existsSync(versionFile)) {
-        return fs.readFileSync(versionFile, 'utf8').trim();
-      }
-    } catch (error) {
-      logger.warn('Could not read current llama.cpp version:', error);
-    }
-    
-    return 'Unknown';
-  }
-
-  getPlatformInfo() {
-    switch (this.platform) {
-      case 'darwin':
-        return {
-          platform: 'darwin',
-          arch: this.arch === 'arm64' ? 'arm64' : 'x64',
-          platformDir: this.arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64',
-          assetPattern: this.arch === 'arm64' ? 'llama-.*-bin-macos-arm64.zip' : 'llama-.*-bin-macos-x64.zip'
-        };
-      case 'linux':
-        return {
-          platform: 'linux',
-          arch: 'x64',
-          platformDir: 'linux-x64',
-          assetPattern: 'llama-.*-bin-ubuntu-vulkan-x64.zip'
-        };
-      case 'win32':
-        return {
-          platform: 'win32',
-          arch: 'x64',
-          platformDir: 'win32-x64',
-          assetPattern: 'llama-.*-bin-win-.*-x64.zip'
-        };
-      default:
-        throw new Error(`Unsupported platform: ${this.platform}-${this.arch}`);
-    }
-  }
-
-  async checkForUpdates() {
-    if (!fetch) {
-      throw new UpdateError('Network functionality not available', 'NO_FETCH', false);
-    }
-
-    try {
-      const response = await makeRobustRequest(`https://api.github.com/repos/${this.githubRepo}/releases/latest`);
-      const release = await response.json();
-      
-      validateReleaseData(release);
-      
-      const currentVersion = this.getCurrentVersion();
-      const latestVersion = release.tag_name;
-      const hasUpdate = currentVersion === 'Unknown' || currentVersion !== latestVersion;
-      
-      const platformInfo = this.getPlatformInfo();
-      const matchingAsset = release.assets.find(asset => 
-        new RegExp(platformInfo.assetPattern, 'i').test(asset.name)
-      );
-      
-      return {
-        hasUpdate,
-        currentVersion,
-        latestVersion,
-        platform: this.platform,
-        downloadSize: matchingAsset ? this.formatFileSize(matchingAsset.size) : 'Unknown size',
-        releaseUrl: release.html_url,
-        downloadUrl: matchingAsset?.browser_download_url,
-        publishedAt: release.published_at,
-        error: matchingAsset ? null : `No compatible binary found for ${this.platform}-${this.arch}`
-      };
-    } catch (error) {
-      logger.error('Error checking for llama.cpp updates:', error);
-      throw error;
-    }
-  }
-
-  async updateBinaries() {
-    if (this.isUpdating) {
-      throw new Error('Binary update already in progress');
-    }
-
-    this.isUpdating = true;
-
-    try {
-      const updateInfo = await this.checkForUpdates();
-      
-      if (!updateInfo.hasUpdate) {
-        return { success: true, message: 'Binaries are already up to date' };
-      }
-
-      if (!updateInfo.downloadUrl) {
-        throw new Error(updateInfo.error || 'No download URL available');
-      }
-
-      const result = await this.downloadAndInstallBinaries(updateInfo);
-      return result;
-    } catch (error) {
-      logger.error('Error updating llama.cpp binaries:', error);
-      return { 
-        success: false, 
-        error: error.message || 'Failed to update binaries' 
-      };
-    } finally {
-      this.isUpdating = false;
-    }
-  }
-
-  async downloadAndInstallBinaries(updateInfo) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    const fsSync = require('fs');
-    
-    // Robust require for adm-zip with fallback
-    let AdmZip;
-    try {
-      AdmZip = require('adm-zip');
-    } catch (requireError) {
-      // Try alternative require paths
-      try {
-        const mainPath = require.resolve('adm-zip', { paths: [process.cwd(), __dirname, path.join(__dirname, '..', 'node_modules')] });
-        AdmZip = require(mainPath);
-      } catch (fallbackError) {
-        // If adm-zip is not available, try using built-in modules for Windows
-        if (this.platform === 'win32') {
-          return await this.downloadAndInstallBinariesWindows(updateInfo);
-        }
-        throw new Error(`Cannot find 'adm-zip' module. Please install it: npm install adm-zip. Error: ${requireError.message}`);
-      }
-    }
-    
-    try {
-      logger.info(`Downloading llama.cpp binaries from: ${updateInfo.downloadUrl}`);
-      
-      // Download the main zip file
-      const response = await makeRobustRequest(updateInfo.downloadUrl);
-      const buffer = Buffer.from(await response.arrayBuffer());
-      
-      // Create temporary file
-      const tempDir = path.join(require('os').tmpdir(), 'clara-llamacpp-update');
-      await fs.mkdir(tempDir, { recursive: true });
-      const tempZipPath = path.join(tempDir, 'llamacpp-binaries.zip');
-      
-      await fs.writeFile(tempZipPath, buffer);
-      logger.info(`Downloaded binaries to: ${tempZipPath}`);
-      
-      // Extract main zip file
-      const zip = new AdmZip(tempZipPath);
-      const extractDir = path.join(tempDir, 'extracted');
-      zip.extractAllTo(extractDir, true);
-      
-      // For Windows, also download CUDA runtime binaries if available
-      let cudaRuntimeFiles = [];
-      if (this.platform === 'win32') {
-        try {
-          cudaRuntimeFiles = await this.downloadCudaRuntimeBinaries(updateInfo, tempDir);
-        } catch (cudaError) {
-          logger.warn('Failed to download CUDA runtime binaries:', cudaError.message);
-          logger.info('Continuing with main binary update. CUDA acceleration may not work optimally.');
-        }
-      }
-      
-      // ===== STOP ALL SERVICES BEFORE UPDATING =====
-      logger.info('🛑 Stopping all services before binary update...');
-      const servicesWereStopped = await this.stopAllServicesForUpdate();
-      
-      try {
-        // Find the platform directory to update
-        const platformInfo = this.getPlatformInfo();
-        const targetPlatformDir = path.join(this.binariesPath, platformInfo.platformDir);
-        
-        // Backup current official llama.cpp files only (preserving Clara's custom files)
-        const backupDir = path.join(this.binariesPath, `${platformInfo.platformDir}-backup-${Date.now()}`);
-        if (fsSync.existsSync(targetPlatformDir)) {
-          await fs.mkdir(backupDir, { recursive: true });
-          
-          // Only backup official llama.cpp files, leave Clara's custom files alone
-          const files = await fs.readdir(targetPlatformDir);
-          for (const file of files) {
-            // Only backup official llama.cpp files (not Clara's custom binaries)
-            if (this.isOfficialLlamacppFile(file)) {
-              const sourcePath = path.join(targetPlatformDir, file);
-              const backupPath = path.join(backupDir, file);
-              
-              if (fsSync.existsSync(sourcePath)) {
-                await fs.copyFile(sourcePath, backupPath);
-                logger.info(`Backed up ${file} to backup directory`);
-              }
-            }
-          }
-        }
-        
-        // Ensure target directory exists
-        await fs.mkdir(targetPlatformDir, { recursive: true });
-        
-        // Find and copy official llama.cpp files from extracted files
-        const extractedFiles = await this.findOfficialFilesInExtracted(extractDir);
-        
-        if (extractedFiles.length === 0) {
-          throw new Error('No official llama.cpp files found in the downloaded archive');
-        }
-        
-        for (const [sourceFile, targetName] of extractedFiles) {
-          const targetPath = path.join(targetPlatformDir, targetName);
-          await fs.copyFile(sourceFile, targetPath);
-          
-          // Make executable for binary files on Unix systems
-          if (this.platform !== 'win32' && this.isExecutableFile(targetName)) {
-            await fs.chmod(targetPath, 0o755);
-          }
-          
-          logger.info(`Installed official file: ${targetName}`);
-        }
-        
-        // Install CUDA runtime files for Windows if downloaded
-        if (cudaRuntimeFiles.length > 0) {
-          for (const [sourceFile, targetName] of cudaRuntimeFiles) {
-            const targetPath = path.join(targetPlatformDir, targetName);
-            await fs.copyFile(sourceFile, targetPath);
-            logger.info(`Installed CUDA runtime file: ${targetName}`);
-          }
-          logger.info(`Successfully installed ${cudaRuntimeFiles.length} CUDA runtime files for GPU acceleration`);
-        }
-        
-        // Save version info
-        const versionFile = path.join(this.binariesPath, 'version.txt');
-        await fs.writeFile(versionFile, updateInfo.latestVersion);
-        
-        // Validate the installation by testing the main binary
-        await this.validateInstallation(targetPlatformDir);
-        
-        logger.info(`Successfully updated llama.cpp binaries and libraries to version ${updateInfo.latestVersion}`);
-        logger.info(`Clara's custom binaries (like llama-swap) were preserved and not modified`);
-        if (cudaRuntimeFiles.length > 0) {
-          logger.info(`CUDA runtime binaries were also updated for optimal GPU acceleration`);
-        }
-        
-      } finally {
-        // ===== RESTART SERVICES AFTER UPDATE =====
-        if (servicesWereStopped) {
-          logger.info('🔄 Restarting services after binary update...');
-          await this.restartAllServicesAfterUpdate();
-        }
-      }
-      
-      // Cleanup
-      await fs.rm(tempDir, { recursive: true, force: true });
-      
-      const successMessage = `Successfully updated llama.cpp binaries and libraries to version ${updateInfo.latestVersion}. Clara's custom binaries were preserved. Services have been restarted.`;
-      const cudaMessage = cudaRuntimeFiles.length > 0 ? ` CUDA runtime binaries were also updated for optimal GPU acceleration.` : '';
-      
-      return { 
-        success: true, 
-        message: successMessage + cudaMessage,
-        version: updateInfo.latestVersion
-      };
-      
-    } catch (error) {
-      logger.error('Error during binary installation:', error);
-      throw new Error(`Installation failed: ${error.message}`);
-    }
-  }
-
-  // Windows-specific binary update using built-in modules if adm-zip fails
-  async downloadAndInstallBinariesWindows(updateInfo) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    const fsSync = require('fs');
-    const { spawn } = require('child_process');
-    
-    try {
-      logger.info(`Downloading llama.cpp binaries for Windows from: ${updateInfo.downloadUrl}`);
-      
-      // Download the main zip file
-      const response = await makeRobustRequest(updateInfo.downloadUrl);
-      const buffer = Buffer.from(await response.arrayBuffer());
-      
-      // Create temporary file
-      const tempDir = path.join(require('os').tmpdir(), 'clara-llamacpp-update');
-      await fs.mkdir(tempDir, { recursive: true });
-      const tempZipPath = path.join(tempDir, 'llamacpp-binaries.zip');
-      
-      await fs.writeFile(tempZipPath, buffer);
-      logger.info(`Downloaded binaries to: ${tempZipPath}`);
-      
-      // Use Windows built-in extract if available, or try PowerShell
-      const extractDir = path.join(tempDir, 'extracted');
-      await fs.mkdir(extractDir, { recursive: true });
-      
-      // Try PowerShell extraction first
-      const success = await this.extractWithPowerShell(tempZipPath, extractDir);
-      
-      if (!success) {
-        // Fallback to manual extraction
-        throw new Error('Could not extract zip file. Please ensure adm-zip package is properly installed.');
-      }
-      
-      // Also download CUDA runtime binaries if available (Windows fallback method)
-      let cudaRuntimeFiles = [];
-      try {
-        cudaRuntimeFiles = await this.downloadCudaRuntimeBinariesWindows(updateInfo, tempDir);
-      } catch (cudaError) {
-        logger.warn('Failed to download CUDA runtime binaries (Windows fallback):', cudaError.message);
-        logger.info('Continuing with main binary update. CUDA acceleration may not work optimally.');
-      }
-      
-      // ===== STOP ALL SERVICES BEFORE UPDATING =====
-      logger.info('🛑 Stopping all services before binary update (Windows fallback)...');
-      const servicesWereStopped = await this.stopAllServicesForUpdate();
-      
-      try {
-        // Continue with the same logic as the main function
-        const platformInfo = this.getPlatformInfo();
-        const targetPlatformDir = path.join(this.binariesPath, platformInfo.platformDir);
-        
-        // Backup current official llama.cpp files only (preserving Clara's custom files)
-        const backupDir = path.join(this.binariesPath, `${platformInfo.platformDir}-backup-${Date.now()}`);
-        if (fsSync.existsSync(targetPlatformDir)) {
-          await fs.mkdir(backupDir, { recursive: true });
-          
-          // Only backup official llama.cpp files, leave Clara's custom files alone
-          const files = await fs.readdir(targetPlatformDir);
-          for (const file of files) {
-            if (this.isOfficialLlamacppFile(file)) {
-              const sourcePath = path.join(targetPlatformDir, file);
-              const backupPath = path.join(backupDir, file);
-              
-              if (fsSync.existsSync(sourcePath)) {
-                await fs.copyFile(sourcePath, backupPath);
-                logger.info(`Backed up ${file} to backup directory`);
-              }
-            }
-          }
-        }
-        
-        // Ensure target directory exists
-        await fs.mkdir(targetPlatformDir, { recursive: true });
-        
-        // Find and copy official llama.cpp files from extracted files
-        const extractedFiles = await this.findOfficialFilesInExtracted(extractDir);
-        
-        if (extractedFiles.length === 0) {
-          throw new Error('No official llama.cpp files found in the downloaded archive');
-        }
-        
-        for (const [sourceFile, targetName] of extractedFiles) {
-          const targetPath = path.join(targetPlatformDir, targetName);
-          await fs.copyFile(sourceFile, targetPath);
-          logger.info(`Installed official file: ${targetName}`);
-        }
-        
-        // Install CUDA runtime files for Windows if downloaded (Windows fallback)
-        if (cudaRuntimeFiles.length > 0) {
-          for (const [sourceFile, targetName] of cudaRuntimeFiles) {
-            const targetPath = path.join(targetPlatformDir, targetName);
-            await fs.copyFile(sourceFile, targetPath);
-            logger.info(`Installed CUDA runtime file: ${targetName}`);
-          }
-          logger.info(`Successfully installed ${cudaRuntimeFiles.length} CUDA runtime files for GPU acceleration (Windows fallback)`);
-        }
-        
-        // Save version info
-        const versionFile = path.join(this.binariesPath, 'version.txt');
-        await fs.writeFile(versionFile, updateInfo.latestVersion);
-        
-        // Validate the installation
-        await this.validateInstallation(targetPlatformDir);
-        
-        logger.info(`Successfully updated llama.cpp binaries and libraries to version ${updateInfo.latestVersion} (Windows fallback method)`);
-        if (cudaRuntimeFiles.length > 0) {
-          logger.info(`CUDA runtime binaries were also updated for optimal GPU acceleration (Windows fallback)`);
-        }
-        
-      } finally {
-        // ===== RESTART SERVICES AFTER UPDATE =====
-        if (servicesWereStopped) {
-          logger.info('🔄 Restarting services after binary update (Windows fallback)...');
-          await this.restartAllServicesAfterUpdate();
-        }
-      }
-      
-      // Cleanup
-      await fs.rm(tempDir, { recursive: true, force: true });
-      
-      const successMessage = `Successfully updated llama.cpp binaries and libraries to version ${updateInfo.latestVersion}. Clara's custom binaries were preserved. Services have been restarted.`;
-      const cudaMessage = cudaRuntimeFiles.length > 0 ? ` CUDA runtime binaries were also updated for optimal GPU acceleration (Windows fallback).` : '';
-      
-      return { 
-        success: true, 
-        message: successMessage + cudaMessage,
-        version: updateInfo.latestVersion
-      };
-      
-    } catch (error) {
-      logger.error('Error during Windows binary installation:', error);
-      throw new Error(`Windows installation failed: ${error.message}`);
-    }
-  }
-
-  // Extract zip using PowerShell on Windows
-  async extractWithPowerShell(zipPath, extractPath) {
-    return new Promise((resolve) => {
-      const powerShellCommand = `
-        try {
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          [System.IO.Compression.ZipFile]::ExtractToDirectory('${zipPath}', '${extractPath}')
-          Write-Output "SUCCESS"
-        } catch {
-          Write-Output "ERROR: $($_.Exception.Message)"
-          exit 1
-        }
-      `;
-      
-      const powerShell = spawn('powershell', [
-        '-Command', powerShellCommand
-      ], {
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-      
-      let output = '';
-      let errorOutput = '';
-      
-      powerShell.stdout.on('data', (data) => {
-        output += data.toString();
-      });
-      
-      powerShell.stderr.on('data', (data) => {
-        errorOutput += data.toString();
-      });
-      
-      powerShell.on('close', (code) => {
-        if (code === 0 && output.includes('SUCCESS')) {
-          logger.info('Successfully extracted using PowerShell');
-          resolve(true);
-        } else {
-          logger.warn('PowerShell extraction failed:', errorOutput || output);
-          resolve(false);
-        }
-      });
-      
-      powerShell.on('error', (error) => {
-        logger.warn('PowerShell extraction error:', error.message);
-        resolve(false);
-      });
-    });
-  }
-
-  // Stop all services that might be using llama.cpp binaries
-  async stopAllServicesForUpdate() {
-    const stoppedServices = [];
-    
-    try {
-      // Get IPC access to communicate with main process
-      const { ipcMain } = require('electron');
-      
-      // Try to stop llama swap service
-      try {
-        logger.info('Stopping LlamaSwap service...');
-        const llamaSwapService = require('./llamaSwapService.cjs');
-        if (llamaSwapService && typeof llamaSwapService.stop === 'function') {
-          await llamaSwapService.stop();
-          stoppedServices.push('llamaSwap');
-          logger.info('✅ LlamaSwap service stopped');
-        }
-      } catch (error) {
-        logger.warn('Could not stop LlamaSwap service:', error.message);
-      }
-      
-      // Try to stop any Python backend services
-      try {
-        logger.info('Stopping Python backend services...');
-        // Send signal to main process to stop Python services
-        const { BrowserWindow } = require('electron');
-        const mainWindow = BrowserWindow.getAllWindows()[0];
-        if (mainWindow && mainWindow.webContents) {
-          mainWindow.webContents.send('stop-python-services');
-          stoppedServices.push('python');
-          logger.info('✅ Python backend services stop signal sent');
-        }
-      } catch (error) {
-        logger.warn('Could not stop Python services:', error.message);
-      }
-      
-      // Try to stop any model server processes
-      try {
-        logger.info('Stopping model server processes...');
-        
-        // Kill any llama-server processes that might be running
-        if (this.platform === 'win32') {
-          const { spawn } = require('child_process');
-          
-          // Try to gracefully stop llama-server processes
-          const taskkill = spawn('taskkill', ['/F', '/IM', 'llama-server.exe'], { 
-            stdio: 'ignore',
-            windowsHide: true 
-          });
-          
-          await new Promise((resolve) => {
-            taskkill.on('close', () => resolve());
-            setTimeout(resolve, 3000); // Don't wait forever
-          });
-          
-          stoppedServices.push('llama-server');
-          logger.info('✅ Windows llama-server processes stopped');
-        } else {
-          // Unix-like systems
-          const { spawn } = require('child_process');
-          
-          const pkill = spawn('pkill', ['-f', 'llama-server'], { 
-            stdio: 'ignore' 
-          });
-          
-          await new Promise((resolve) => {
-            pkill.on('close', () => resolve());
-            setTimeout(resolve, 3000); // Don't wait forever
-          });
-          
-          stoppedServices.push('llama-server');
-          logger.info('✅ Unix llama-server processes stopped');
-        }
-      } catch (error) {
-        logger.warn('Could not stop model server processes:', error.message);
-      }
-      
-      // Wait a bit for processes to fully release file handles
-      logger.info('⏳ Waiting for processes to release file handles...');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      logger.info(`🛑 Stopped services: ${stoppedServices.join(', ')}`);
-      return stoppedServices.length > 0;
-      
-    } catch (error) {
-      logger.error('Error stopping services:', error);
-      return false;
-    }
-  }
-
-  // Restart services after update
-  async restartAllServicesAfterUpdate() {
-    try {
-      // Wait a moment for the system to settle
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Repair binary paths after update
-      try {
-        logger.info('🔧 Repairing binary paths after update...');
-        const LlamaSwapService = require('./llamaSwapService.cjs');
-        await LlamaSwapService.repairBinariesAfterUpdate();
-        logger.info('✅ Binary paths repaired after update');
-      } catch (repairError) {
-        logger.warn('Binary repair failed, but continuing with restart:', repairError.message);
-      }
-      
-      // Restart LlamaSwap service
-      try {
-        logger.info('Restarting LlamaSwap service...');
-        const llamaSwapService = require('./llamaSwapService.cjs');
-        if (llamaSwapService && typeof llamaSwapService.restart === 'function') {
-          await llamaSwapService.restart();
-          logger.info('✅ LlamaSwap service restarted');
-        }
-      } catch (error) {
-        logger.warn('Could not restart LlamaSwap service:', error.message);
-      }
-      
-      // Send signal to restart Python services
-      try {
-        logger.info('Restarting Python backend services...');
-        const { BrowserWindow } = require('electron');
-        const mainWindow = BrowserWindow.getAllWindows()[0];
-        if (mainWindow && mainWindow.webContents) {
-          mainWindow.webContents.send('restart-python-services');
-          logger.info('✅ Python backend services restart signal sent');
-        }
-      } catch (error) {
-        logger.warn('Could not restart Python services:', error.message);
-      }
-      
-      // The services will automatically start when needed, so we don't need to explicitly start model servers
-      logger.info('🔄 Service restart completed');
-      
-    } catch (error) {
-      logger.error('Error restarting services:', error);
-    }
-  }
-
-  // Check if a file is an official llama.cpp file (binaries, libraries, headers, etc.)
-  // Now includes ALL files except Clara's custom binaries
-  isOfficialLlamacppFile(fileName) {
-    // Exclude Clara's custom binaries - these are the ONLY files we don't want to touch
-    const claraCustomBinaries = [
-      'llama-swap',
-      'llama-swap.exe',
-      'llama-swap-darwin',
-      'llama-swap-darwin-arm64',
-      'llama-swap-linux',
-      'llama-swap-win32-x64.exe'
-    ];
-    
-    // Don't touch Clara's custom binaries (llamaswap files)
-    if (claraCustomBinaries.some(custom => fileName.includes(custom))) {
-      return false;
-    }
-    
-    // Everything else from the llama.cpp zip is considered official and should be updated
-    return true;
-  }
-
-  // Check if a file should be made executable
-  isExecutableFile(fileName) {
-    // On Windows, executables have .exe extension
-    if (this.platform === 'win32') {
-      return fileName.endsWith('.exe');
-    }
-    
-    // On Unix systems (macOS/Linux), check for common binary patterns
-    // Look for files without extensions or with common binary names
-    const hasNoExtension = !fileName.includes('.') || 
-                          fileName.endsWith('.bin') || 
-                          fileName.endsWith('.out');
-    
-    // Common patterns for llama.cpp binaries
-    const isBinaryPattern = fileName.startsWith('llama-') ||
-                           fileName.startsWith('ggml-') ||
-                           fileName.includes('server') ||
-                           fileName.includes('cli') ||
-                           fileName.includes('quantize') ||
-                           fileName.includes('perplexity') ||
-                           fileName.includes('bench') ||
-                           fileName.includes('eval') ||
-                           fileName.includes('embedding') ||
-                           fileName.includes('convert') ||
-                           fileName.includes('finetune') ||
-                           fileName.includes('export');
-    
-    // Make executable if it looks like a binary and doesn't have a typical non-executable extension
-    const nonExecutableExtensions = ['.so', '.dylib', '.dll', '.h', '.hpp', '.c', '.cpp', '.txt', '.md', '.json', '.xml', '.metal', '.py', '.sh'];
-    const hasNonExecutableExtension = nonExecutableExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
-    
-    return (hasNoExtension && isBinaryPattern) && !hasNonExecutableExtension;
-  }
-
-  async findOfficialFilesInExtracted(extractDir) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    
-    const filesMap = [];
-    
-    // Required core files that must be present for a valid update
-    const requiredFiles = this.platform === 'win32' 
-      ? ['llama-server.exe']
-      : ['llama-server'];
-    
-    // Helper function to search directory recursively and include ALL files except llamaswap
-    async function searchDirectory(dir) {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-        
-        if (entry.isDirectory()) {
-          await searchDirectory(fullPath);
-        } else if (entry.isFile()) {
-          // Skip Clara's custom llamaswap binaries
-          const claraCustomBinaries = [
-            'llama-swap',
-            'llama-swap.exe',
-            'llama-swap-darwin',
-            'llama-swap-darwin-arm64',
-            'llama-swap-linux',
-            'llama-swap-win32-x64.exe'
-          ];
-          
-          // Don't include llamaswap files
-          if (claraCustomBinaries.some(custom => entry.name.includes(custom))) {
-            logger.info(`Skipping Clara custom binary: ${entry.name}`);
-            continue;
-          }
-          
-          // Include ALL other files from the llama.cpp archive
-          filesMap.push([fullPath, entry.name]);
-          logger.info(`Found file for update: ${entry.name}`);
-        }
-      }
-    }
-    
-    await searchDirectory(extractDir);
-    
-    // Validate that we have the essential files for a complete update
-    const foundFiles = filesMap.map(([, targetName]) => targetName);
-    const missingRequired = requiredFiles.filter(required => !foundFiles.includes(required));
-    
-    if (missingRequired.length > 0) {
-      logger.warn(`Missing required files for complete update: ${missingRequired.join(', ')}`);
-      logger.warn(`Found files: ${foundFiles.slice(0, 20).join(', ')}${foundFiles.length > 20 ? '...' : ''}`);
-      logger.warn('This might cause compatibility issues. Skipping update.');
-      throw new Error(`Incomplete update package: missing required files ${missingRequired.join(', ')}`);
-    }
-    
-    logger.info(`Found ${filesMap.length} official files for update: ${foundFiles.slice(0, 10).join(', ')}${foundFiles.length > 10 ? '...' : ''}`);
-    
-    return filesMap;
-  }
-
-  formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  }
-
-  async validateInstallation(targetPlatformDir) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    const fsSync = require('fs');
-    
-    try {
-      // Check that the main binary exists and is executable
-      const mainBinaryPath = path.join(targetPlatformDir, this.platform === 'win32' ? 'llama-server.exe' : 'llama-server');
-      
-      if (!fsSync.existsSync(mainBinaryPath)) {
-        throw new Error(`Main binary not found: ${mainBinaryPath}`);
-      }
-      
-      // Check that required libraries exist
-      const requiredLibs = this.platform === 'darwin' 
-        ? ['libllama.dylib']
-        : this.platform === 'win32'
-        ? ['llama.dll']
-        : ['libllama.so'];
-      
-      for (const lib of requiredLibs) {
-        const libPath = path.join(targetPlatformDir, lib);
-        if (!fsSync.existsSync(libPath)) {
-          throw new Error(`Required library not found: ${libPath}`);
-        }
-      }
-      
-      logger.info('Installation validation completed successfully');
-    } catch (error) {
-      logger.error('Installation validation failed:', error);
-      throw new Error(`Installation validation failed: ${error.message}`);
-    }
-  }
-
-  // Download CUDA runtime binaries for Windows
-  async downloadCudaRuntimeBinaries(updateInfo, tempDir) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    
-    try {
-      // Get the latest release info to find CUDA runtime assets
-      const response = await makeRobustRequest(`https://api.github.com/repos/${this.githubRepo}/releases/latest`);
-      const release = await response.json();
-      
-      // Look for CUDA runtime assets (e.g., cudart-llama-bin-win-cuda-12.4-x64.zip)
-      const cudaAssets = release.assets.filter(asset => 
-        asset.name.match(/cudart.*llama.*bin.*win.*cuda.*x64\.zip/i)
-      );
-      
-      if (cudaAssets.length === 0) {
-        logger.info('No CUDA runtime binaries found in release assets');
-        return [];
-      }
-      
-      // Sort by name to get the latest CUDA version (usually the highest version number)
-      cudaAssets.sort((a, b) => b.name.localeCompare(a.name));
-      const cudaAsset = cudaAssets[0];
-      
-      logger.info(`Found CUDA runtime asset: ${cudaAsset.name}`);
-      logger.info(`Downloading CUDA runtime binaries from: ${cudaAsset.browser_download_url}`);
-      
-      // Download the CUDA runtime zip
-      const cudaResponse = await makeRobustRequest(cudaAsset.browser_download_url);
-      const cudaBuffer = Buffer.from(await cudaResponse.arrayBuffer());
-      
-      // Save CUDA runtime zip
-      const cudaTempZipPath = path.join(tempDir, 'cuda-runtime.zip');
-      await fs.writeFile(cudaTempZipPath, cudaBuffer);
-      logger.info(`Downloaded CUDA runtime to: ${cudaTempZipPath}`);
-      
-      // Extract CUDA runtime zip
-      let AdmZip;
-      try {
-        AdmZip = require('adm-zip');
-      } catch (requireError) {
-        // Try alternative require paths
-        const mainPath = require.resolve('adm-zip', { paths: [process.cwd(), __dirname, path.join(__dirname, '..', 'node_modules')] });
-        AdmZip = require(mainPath);
-      }
-      
-      const cudaZip = new AdmZip(cudaTempZipPath);
-      const cudaExtractDir = path.join(tempDir, 'cuda-extracted');
-      cudaZip.extractAllTo(cudaExtractDir, true);
-      
-      // Find all CUDA runtime files (DLLs) in the extracted directory
-      const cudaFiles = await this.findCudaRuntimeFilesInExtracted(cudaExtractDir);
-      
-      if (cudaFiles.length === 0) {
-        logger.warn('No CUDA runtime files found in extracted CUDA archive');
-        return [];
-      }
-      
-      logger.info(`Found ${cudaFiles.length} CUDA runtime files to install`);
-      return cudaFiles;
-      
-    } catch (error) {
-      logger.error('Error downloading CUDA runtime binaries:', error);
-      throw new Error(`Failed to download CUDA runtime: ${error.message}`);
-    }
-  }
-
-  // Find CUDA runtime files in extracted directory
-  async findCudaRuntimeFilesInExtracted(extractDir) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    
-    const cudaFiles = [];
-    
-    // CUDA runtime files we're looking for
-    const cudaRuntimePatterns = [
-      /^cudart64_\d+\.dll$/i,           // CUDA runtime (e.g., cudart64_124.dll)
-      /^cublas64_\d+\.dll$/i,           // cuBLAS (e.g., cublas64_12.dll)
-      /^cublasLt64_\d+\.dll$/i,         // cuBLAS LT (e.g., cublasLt64_12.dll)
-      /^curand64_\d+\.dll$/i,           // cuRAND (e.g., curand64_10.dll)
-      /^cusolver64_\d+\.dll$/i,         // cuSOLVER (e.g., cusolver64_11.dll)
-      /^cusparse64_\d+\.dll$/i,         // cuSPARSE (e.g., cusparse64_12.dll)
-      /^nvrtc64_\d+\.dll$/i,            // NVRTC (e.g., nvrtc64_120_0.dll)
-      /^nvrtc-builtins64_\d+\.dll$/i    // NVRTC builtins
-    ];
-    
-    // Helper function to search directory recursively
-    async function searchDirectory(dir) {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-        
-        if (entry.isDirectory()) {
-          await searchDirectory(fullPath);
-        } else if (entry.isFile()) {
-          // Check if this file matches any CUDA runtime pattern
-          const matchesCudaPattern = cudaRuntimePatterns.some(pattern => 
-            pattern.test(entry.name)
-          );
-          
-          if (matchesCudaPattern) {
-            cudaFiles.push([fullPath, entry.name]);
-            logger.info(`Found CUDA runtime file: ${entry.name}`);
-          }
-        }
-      }
-    }
-    
-    await searchDirectory(extractDir);
-    
-    return cudaFiles;
-  }
-
-  // Download CUDA runtime binaries for Windows using PowerShell extraction (fallback method)
-  async downloadCudaRuntimeBinariesWindows(updateInfo, tempDir) {
-    const path = require('path');
-    const fs = require('fs').promises;
-    
-    try {
-      // Get the latest release info to find CUDA runtime assets
-      const response = await makeRobustRequest(`https://api.github.com/repos/${this.githubRepo}/releases/latest`);
-      const release = await response.json();
-      
-      // Look for CUDA runtime assets (e.g., cudart-llama-bin-win-cuda-12.4-x64.zip)
-      const cudaAssets = release.assets.filter(asset => 
-        asset.name.match(/cudart.*llama.*bin.*win.*cuda.*x64\.zip/i)
-      );
-      
-      if (cudaAssets.length === 0) {
-        logger.info('No CUDA runtime binaries found in release assets (Windows fallback)');
-        return [];
-      }
-      
-      // Sort by name to get the latest CUDA version (usually the highest version number)
-      cudaAssets.sort((a, b) => b.name.localeCompare(a.name));
-      const cudaAsset = cudaAssets[0];
-      
-      logger.info(`Found CUDA runtime asset: ${cudaAsset.name} (Windows fallback)`);
-      logger.info(`Downloading CUDA runtime binaries from: ${cudaAsset.browser_download_url}`);
-      
-      // Download the CUDA runtime zip
-      const cudaResponse = await makeRobustRequest(cudaAsset.browser_download_url);
-      const cudaBuffer = Buffer.from(await cudaResponse.arrayBuffer());
-      
-      // Save CUDA runtime zip
-      const cudaTempZipPath = path.join(tempDir, 'cuda-runtime.zip');
-      await fs.writeFile(cudaTempZipPath, cudaBuffer);
-      logger.info(`Downloaded CUDA runtime to: ${cudaTempZipPath} (Windows fallback)`);
-      
-      // Extract CUDA runtime zip using PowerShell
-      const cudaExtractDir = path.join(tempDir, 'cuda-extracted');
-      await fs.mkdir(cudaExtractDir, { recursive: true });
-      
-      const extractSuccess = await this.extractWithPowerShell(cudaTempZipPath, cudaExtractDir);
-      
-      if (!extractSuccess) {
-        throw new Error('Could not extract CUDA runtime zip using PowerShell');
-      }
-      
-      // Find all CUDA runtime files (DLLs) in the extracted directory
-      const cudaFiles = await this.findCudaRuntimeFilesInExtracted(cudaExtractDir);
-      
-      if (cudaFiles.length === 0) {
-        logger.warn('No CUDA runtime files found in extracted CUDA archive (Windows fallback)');
-        return [];
-      }
-      
-      logger.info(`Found ${cudaFiles.length} CUDA runtime files to install (Windows fallback)`);
-      return cudaFiles;
-      
-    } catch (error) {
-      logger.error('Error downloading CUDA runtime binaries (Windows fallback):', error);
-      throw new Error(`Failed to download CUDA runtime (Windows fallback): ${error.message}`);
-    }
-  }
-}
-
-// Create llama.cpp update service instance
-const llamacppUpdateService = new LlamacppUpdateService();
-
-// Safe llama.cpp update check for UI
-async function checkLlamacppUpdates() {
-  try {
-    return await llamacppUpdateService.checkForUpdates();
-  } catch (error) {
-    logger.error('Error checking llama.cpp updates:', error);
-    
-    let errorMessage = 'Failed to check for llama.cpp updates';
-    
-    if (error instanceof UpdateError) {
-      errorMessage = error.message;
-    } else {
-      errorMessage = error.message || 'Unknown error occurred';
-    }
-    
-    return {
-      hasUpdate: false,
-      error: errorMessage,
-      platform: llamacppUpdateService.platform,
-      currentVersion: llamacppUpdateService.getCurrentVersion()
-    };
-  }
-}
-
-// Safe llama.cpp binary update
-async function updateLlamacppBinaries() {
-  try {
-    return await llamacppUpdateService.updateBinaries();
-  } catch (error) {
-    logger.error('Error updating llama.cpp binaries:', error);
-    return {
-      success: false,
-      error: error.message || 'Failed to update binaries'
-    };
-  }
-}
-
+// Export both enhanced and legacy functions for compatibility
 module.exports = { 
-  setupAutoUpdater, 
-  checkForUpdates, 
-  getUpdateInfo,
-  checkLlamacppUpdates,
-  updateLlamacppBinaries,
-  platformUpdateService 
+  // Enhanced functions (new)
+  setupEnhancedAutoUpdater,
+  checkForUpdatesEnhanced,
+  getEnhancedUpdateInfo,
+  enhancedPlatformUpdateService,
+  
+  // Preferences management
+  getUpdatePreferences,
+  saveUpdatePreferences,
+  
+  // Legacy functions (for backward compatibility)
+  setupAutoUpdater: setupEnhancedAutoUpdater,
+  checkForUpdates: checkForUpdatesEnhanced,
+  getUpdateInfo: getEnhancedUpdateInfo,
+  platformUpdateService: enhancedPlatformUpdateService
 };
