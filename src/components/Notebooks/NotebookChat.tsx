@@ -1,95 +1,75 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Send, User, Bot, Copy, Check, MessageSquare, AlertCircle, FileText, ExternalLink, ChevronDown, ChevronUp, BookOpen, AlertTriangle, Upload, Loader2, Brain } from 'lucide-react';
-import { claraNotebookService, NotebookCitation } from '../../services/claraNotebookService';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  MessageSquare, Send, Bot, User, Copy, Check, FileText, ExternalLink,
+  AlertTriangle, Upload
+} from 'lucide-react';
 import DocumentUpload from './DocumentUpload';
 
 interface ChatMessage {
   id: string;
-  type: 'user' | 'assistant' | 'summary';
+  type: 'user' | 'assistant';
   content: string;
-  timestamp: string;
-  citations?: NotebookCitation[];
+  timestamp: Date;
+  role?: 'user' | 'assistant'; // Add role property for compatibility
+  citations?: Array<{
+    file_path: string;
+    title: string;
+    content?: string;
+  }>;
 }
 
 interface ProgressState {
   isActive: boolean;
-  type: string;
   message: string;
   progress: number;
   details?: string;
 }
 
 interface NotebookChatProps {
+  messages?: ChatMessage[];
+  onSendMessage?: (message: string) => void;
+  isLoading?: boolean;
   notebookId: string;
-  documentCount: number;
-  completedDocumentCount: number;
+  documentCount?: number;
+  completedDocumentCount?: number;
+  isBackendHealthy?: boolean;
   onDocumentUpload?: (files: File[]) => void;
 }
 
-const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, completedDocumentCount, onDocumentUpload }) => {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+const NotebookChat: React.FC<NotebookChatProps> = ({
+  messages,
+  onSendMessage = () => {},
+  isLoading = false,
+  notebookId,
+  documentCount = 0,
+  completedDocumentCount = 0,
+  isBackendHealthy = true,
+  onDocumentUpload
+}) => {
   const [inputMessage, setInputMessage] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(messages || []);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [isBackendHealthy, setIsBackendHealthy] = useState(false);
-  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
-  const [isSummaryCollapsed, setIsSummaryCollapsed] = useState(false);
-  const [summaryGenerated, setSummaryGenerated] = useState(false);
-  const [showSkeletonLoading, setShowSkeletonLoading] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [progressState, setProgressState] = useState<ProgressState | null>(null);
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Subscribe to backend health changes
-  useEffect(() => {
-    const unsubscribe = claraNotebookService.onHealthChange(setIsBackendHealthy);
-    return unsubscribe;
-  }, []);
-
-  // Listen for progress updates from Clara assistant
+  // Progress tracking effect
   useEffect(() => {
     let hideTimeout: NodeJS.Timeout | null = null;
-
-    const handleProgressUpdate = (event: CustomEvent<ProgressState>) => {
-      // Clear any existing timeout
-      if (hideTimeout) {
-        clearTimeout(hideTimeout);
-        hideTimeout = null;
-      }
-
-      setProgressState(event.detail);
-      
-      // Auto-hide progress after completion with longer delay
-      if (event.detail.progress >= 100) {
-        hideTimeout = setTimeout(() => {
-          setProgressState(null);
-        }, 3000);
-      }
-    };
-
-    // Listen for progress events
-    window.addEventListener('clara-progress-update', handleProgressUpdate as EventListener);
-
-    // Also listen for console logs from Clara assistant and parse them
+    
     const originalLog = console.log;
     console.log = (...args) => {
-      originalLog.apply(console, args);
+      originalLog(...args);
       
-      // Check if this is a Clara progress log
-      if (args.length > 0 && typeof args[0] === 'string' && args[0].includes('Setting new progressState')) {
+      const message = args.join(' ');
+      if (message.includes('progress:')) {
         try {
-          // Parse the progress object from the log
-          const progressObj = args.find(arg => 
-            typeof arg === 'object' && 
-            arg !== null && 
-            'isActive' in arg && 
-            'message' in arg && 
-            'progress' in arg
-          );
-          
-          if (progressObj) {
-            // Clear any existing timeout
+          const progressMatch = message.match(/progress:\s*({.*})/);
+          if (progressMatch) {
+            const progressObj = JSON.parse(progressMatch[1]);
+            
             if (hideTimeout) {
               clearTimeout(hideTimeout);
               hideTimeout = null;
@@ -110,6 +90,27 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
       }
     };
 
+    const handleProgressUpdate = (event: CustomEvent) => {
+      const progressObj = event.detail;
+      if (progressObj) {
+        if (hideTimeout) {
+          clearTimeout(hideTimeout);
+          hideTimeout = null;
+        }
+
+        setProgressState(progressObj as ProgressState);
+        
+        // Auto-hide progress after completion with longer delay
+        if (progressObj.progress >= 100) {
+          hideTimeout = setTimeout(() => {
+            setProgressState(null);
+          }, 3000);
+        }
+      }
+    };
+
+    window.addEventListener('clara-progress-update', handleProgressUpdate as EventListener);
+
     return () => {
       window.removeEventListener('clara-progress-update', handleProgressUpdate as EventListener);
       console.log = originalLog;
@@ -118,13 +119,6 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
       }
     };
   }, []);
-
-  // Generate summary when notebook changes or backend becomes healthy
-  useEffect(() => {
-    if (isBackendHealthy && !summaryGenerated && documentCount > 0 && completedDocumentCount === documentCount) {
-      generateDocumentSummary();
-    }
-  }, [notebookId, isBackendHealthy, summaryGenerated, documentCount, completedDocumentCount]);
 
   // Auto-scroll to bottom when new messages are added
   useEffect(() => {
@@ -140,120 +134,32 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
     }
   }, [inputMessage]);
 
-  const generateDocumentSummary = async () => {
-    if (!isBackendHealthy || isGeneratingSummary || summaryGenerated || documentCount === 0 || completedDocumentCount !== documentCount) return;
+  // Load chat history and templates on mount
+  useEffect(() => {
+    // Templates and history functionality removed
+  }, [isBackendHealthy, notebookId]);
 
-    setIsGeneratingSummary(true);
-    setShowSkeletonLoading(true);
-    setSummaryGenerated(true);
 
-    try {
-      // Start skeleton loading immediately
-      const skeletonPromise = new Promise(resolve => 
-        setTimeout(resolve, 2500) // Show skeleton for 2.5 seconds
-      );
-      
-      // Start API request
-      const summaryPromise = claraNotebookService.generateSummary(notebookId);
-      
-      // Wait for both skeleton time AND API response
-      const [, response] = await Promise.all([skeletonPromise, summaryPromise]);
-      
-      const summaryMessage: ChatMessage = {
-        id: 'summary-' + Date.now().toString(),
-        type: 'summary',
-        content: response.answer,
-        timestamp: new Date().toISOString(),
-        citations: response.citations
-      };
 
-      setMessages([summaryMessage]);
-    } catch (error) {
-      console.error('Error generating summary:', error);
-      // If summary generation fails, we'll just start with no summary
-      // The user can still use regular chat
-    } finally {
-      // Ensure skeleton shows for minimum time even if API is very fast
-      setTimeout(() => {
-        setShowSkeletonLoading(false);
-        setIsGeneratingSummary(false);
-      }, 100); // Small delay to ensure smooth transition
-    }
-  };
+  // Update chat messages when props change
+  useEffect(() => {
+    setChatMessages(messages || []);
+  }, [messages]);
 
-  const handleSendMessage = async () => {
-    if (!inputMessage.trim() || isLoading) return;
-
-    if (!isBackendHealthy) {
-      const errorMessage: ChatMessage = {
+  const handleSendMessage = () => {
+    if (inputMessage.trim() && !isLoading && isBackendHealthy && completedDocumentCount > 0) {
+      const userMessage: ChatMessage = {
         id: Date.now().toString(),
-        type: 'assistant',
-        content: 'Sorry, the notebook backend is currently unavailable. Please check your connection and try again.',
-        timestamp: new Date().toISOString()
+        type: 'user',
+        content: inputMessage.trim(),
+        timestamp: new Date()
       };
-      setMessages(prev => [...prev, errorMessage]);
-      return;
-    }
-
-    if (completedDocumentCount === 0) {
-      const errorMessage: ChatMessage = {
-        id: Date.now().toString(),
-        type: 'assistant',
-        content: documentCount > 0 
-          ? 'Please wait for your documents to finish processing before asking questions.'
-          : 'Please upload documents to your notebook before asking questions. I need content to search through and provide answers.',
-        timestamp: new Date().toISOString()
-      };
-      setMessages(prev => [...prev, errorMessage]);
+      
+      // Add user message immediately
+      setChatMessages(prev => [...prev, userMessage]);
+      
+      onSendMessage(inputMessage.trim());
       setInputMessage('');
-      return;
-    }
-
-    // Collapse summary when first question is asked
-    if (!isSummaryCollapsed && messages.some(m => m.type === 'summary')) {
-      setIsSummaryCollapsed(true);
-    }
-
-    const userMessage: ChatMessage = {
-      id: Date.now().toString(),
-      type: 'user',
-      content: inputMessage.trim(),
-      timestamp: new Date().toISOString()
-    };
-
-    setMessages(prev => [...prev, userMessage]);
-    setInputMessage('');
-    setIsLoading(true);
-
-    try {
-      // Query the notebook using the claraNotebookService
-      const response = await claraNotebookService.queryNotebook(notebookId, {
-        question: inputMessage.trim(),
-        mode: 'hybrid',
-        response_type: 'Multiple Paragraphs',
-        top_k: 60
-      });
-
-      const assistantResponse: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        type: 'assistant',
-        content: response.answer,
-        timestamp: new Date().toISOString(),
-        citations: response.citations
-      };
-      setMessages(prev => [...prev, assistantResponse]);
-
-    } catch (error) {
-      console.error('Error sending message:', error);
-      const errorMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        type: 'assistant',
-        content: `Sorry, I encountered an error while processing your request: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again.`,
-        timestamp: new Date().toISOString()
-      };
-      setMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setIsLoading(false);
     }
   };
 
@@ -264,400 +170,164 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
     }
   };
 
-  const copyToClipboard = async (content: string, messageId: string) => {
+  const copyToClipboard = async (text: string, messageId: string) => {
     try {
-      await navigator.clipboard.writeText(content);
+      await navigator.clipboard.writeText(text);
       setCopiedId(messageId);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (error) {
-      console.error('Failed to copy to clipboard:', error);
+      console.error('Failed to copy text:', error);
     }
   };
 
-  const handleDocumentUpload = async (files: File[]) => {
-    setShowUploadModal(false);
-    if (onDocumentUpload) {
-      onDocumentUpload(files);
-    }
+  const formatTime = (timestamp: Date) => {
+    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-
-
-  const formatTime = (timestamp: string) => {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString('en-US', { 
-      hour: '2-digit', 
-      minute: '2-digit' 
+  const formatMessage = (content: string) => {
+    // Split by code blocks and regular text
+    const parts = content.split(/(```[\s\S]*?```)/g);
+    
+    return parts.map((part, index) => {
+      if (part.startsWith('```') && part.endsWith('```')) {
+        // Code block
+        const code = part.slice(3, -3);
+        const lines = code.split('\n');
+        const language = lines[0]?.trim() || '';
+        const codeContent = language ? lines.slice(1).join('\n') : code;
+        
+        return (
+          <div key={index} className="my-4">
+            <div className="bg-gray-900 rounded-lg p-4 overflow-x-auto">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs text-gray-400 uppercase tracking-wide">{language || 'code'}</span>
+                <button
+                  onClick={() => copyToClipboard(codeContent, `code-${index}`)}
+                  className="text-gray-400 hover:text-white transition-colors"
+                >
+                  <Copy className="w-4 h-4" />
+                </button>
+              </div>
+              <pre className="text-gray-100 text-sm leading-relaxed">
+                <code>{codeContent}</code>
+              </pre>
+            </div>
+          </div>
+        );
+      } else {
+        // Regular text with basic markdown
+        return (
+          <div key={index}>
+            {part.split('\n').map((line, lineIndex) => {
+              if (line.trim() === '') return <br key={lineIndex} />;
+              
+              // Handle bold text
+              const boldFormatted = line.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+              // Handle italic text
+              const italicFormatted = boldFormatted.replace(/\*(.*?)\*/g, '<em>$1</em>');
+              // Handle inline code
+              const codeFormatted = italicFormatted.replace(/`([^`]+)`/g, '<code class="bg-gray-200 dark:bg-gray-700 px-1 py-0.5 rounded text-sm">$1</code>');
+              
+              return (
+                <p key={lineIndex} className="mb-2 leading-relaxed" dangerouslySetInnerHTML={{ __html: codeFormatted }} />
+              );
+            })}
+          </div>
+        );
+      }
     });
   };
 
-  // Progress indicator component
-  const ProgressIndicator: React.FC<{ progress: ProgressState }> = ({ progress }) => {
-    const circumference = 2 * Math.PI * 16; // radius = 16
-    const strokeDasharray = circumference;
-    const strokeDashoffset = circumference - (progress.progress / 100) * circumference;
-
-    return (
-      <div className="fixed top-20 right-4 z-40 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-3 min-w-[200px] animate-in slide-in-from-right-2 duration-300">
-        <div className="flex items-center gap-3">
-          {/* Progress Ring */}
-          <div className="relative w-10 h-10 flex-shrink-0">
-            <svg className="w-10 h-10 transform -rotate-90" viewBox="0 0 36 36">
-              {/* Background circle */}
-              <circle
-                cx="18"
-                cy="18"
-                r="16"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                className="text-gray-200 dark:text-gray-600"
-              />
-              {/* Progress circle */}
-              <circle
-                cx="18"
-                cy="18"
-                r="16"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeDasharray={strokeDasharray}
-                strokeDashoffset={strokeDashoffset}
-                strokeLinecap="round"
-                className="text-blue-500"
-                style={{
-                  transition: 'stroke-dashoffset 0.3s ease-in-out'
-                }}
-              />
-            </svg>
-            {/* Icon in center */}
-            <div className="absolute inset-0 flex items-center justify-center">
-              {progress.type === 'context_loading' ? (
-                <Brain className="w-4 h-4 text-blue-500" />
-              ) : (
-                <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
-              )}
-            </div>
-          </div>
-
-          {/* Progress text */}
-          <div className="flex-1 min-w-0">
-            <div className="text-sm font-medium text-gray-900 dark:text-white truncate">
-              {progress.message}
-            </div>
-            <div className="text-xs text-gray-500 dark:text-gray-400">
-              {progress.progress}%
-              {progress.details && (
-                <div className="truncate mt-1">
-                  {progress.details}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Close button */}
-          <button
-            onClick={() => setProgressState(null)}
-            className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors flex-shrink-0"
-          >
-            <Check className="w-3 h-3 text-gray-400" />
-          </button>
-        </div>
-      </div>
-    );
+  const handleDocumentUpload = (files: File[]) => {
+    if (onDocumentUpload) {
+      onDocumentUpload(files);
+    } else {
+      // Handle document upload logic here
+      console.log('Uploading documents:', files.map(f => f.name));
+    }
+    setShowUploadModal(false);
   };
-
-  // Simple markdown-like formatting
-  const formatMessage = (content: string) => {
-    return content
-      .split('\n')
-      .map((line, index) => {
-        // Headers
-        if (line.startsWith('### ')) {
-          return (
-            <h3 key={index} className="text-lg font-semibold text-gray-900 dark:text-white mt-4 mb-2">
-              {line.replace('### ', '')}
-            </h3>
-          );
-        }
-        if (line.startsWith('## ')) {
-          return (
-            <h2 key={index} className="text-xl font-semibold text-gray-900 dark:text-white mt-4 mb-2">
-              {line.replace('## ', '')}
-            </h2>
-          );
-        }
-        if (line.startsWith('# ')) {
-          return (
-            <h1 key={index} className="text-2xl font-bold text-gray-900 dark:text-white mt-4 mb-2">
-              {line.replace('# ', '')}
-            </h1>
-          );
-        }
-        
-        // Bold text
-        if (line.includes('**')) {
-          const parts = line.split('**');
-          return (
-            <p key={index} className="mb-2">
-              {parts.map((part, partIndex) => 
-                partIndex % 2 === 1 ? (
-                  <strong key={partIndex} className="font-semibold text-gray-900 dark:text-white">
-                    {part}
-                  </strong>
-                ) : (
-                  <span key={partIndex}>{part}</span>
-                )
-              )}
-            </p>
-          );
-        }
-        
-        // List items
-        if (line.startsWith('- ')) {
-          return (
-            <li key={index} className="ml-4 mb-1 list-disc">
-              {line.replace('- ', '')}
-            </li>
-          );
-        }
-        
-        // Numbered lists
-        if (line.match(/^\d+\. /)) {
-          return (
-            <li key={index} className="ml-4 mb-1 list-decimal">
-              {line.replace(/^\d+\. /, '')}
-            </li>
-          );
-        }
-        
-        // Empty lines
-        if (line.trim() === '') {
-          return <br key={index} />;
-        }
-        
-        // Regular paragraphs
-        return (
-          <p key={index} className="mb-2">
-            {line}
-          </p>
-        );
-      });
-  };
-
-  const summaryMessage = messages.find(m => m.type === 'summary');
-  const chatMessages = messages.filter(m => m.type !== 'summary');
 
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      {/* Summary Section */}
-      {(summaryMessage || isGeneratingSummary) && (
-        <div className={`flex-shrink-0 border-b border-gray-200 dark:border-gray-700 ${isSummaryCollapsed ? 'bg-gray-50 dark:bg-gray-900' : 'bg-blue-50 dark:bg-blue-900/20'}`}>
-          <div className="p-4">
-            <button
-              onClick={() => setIsSummaryCollapsed(!isSummaryCollapsed)}
-              className="flex items-center justify-between w-full text-left group"
-            >
-              <div className="flex items-center gap-2">
-                <BookOpen className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                <h3 className="font-medium text-gray-900 dark:text-white">
-                  Document Summary
-                </h3>
-                {summaryMessage?.citations && (
-                  <span className="text-xs text-gray-500 dark:text-gray-400 bg-gray-200 dark:bg-gray-700 px-2 py-1 rounded-full">
-                    {summaryMessage.citations.length} sources
-                  </span>
-                )}
-
-              </div>
-              <div className="text-gray-400 group-hover:text-gray-600 dark:group-hover:text-gray-300">
-                {isSummaryCollapsed ? (
-                  <ChevronDown className="w-4 h-4" />
-                ) : (
-                  <ChevronUp className="w-4 h-4" />
-                )}
-              </div>
-            </button>
-            
-            {!isSummaryCollapsed && (
-              <div className="mt-3">
-                {(isGeneratingSummary || showSkeletonLoading) ? (
-                  <div className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700 glassmorphic">
-                    {/* Skeleton Loading for Summary */}
-                    <div className="space-y-3">
-                      <div className="flex items-center space-x-2 mb-3">
-                        <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-                        <span className="text-sm text-gray-600 dark:text-gray-400">Generating summary of your documents...</span>
-                      </div>
-                      
-                      {/* Skeleton text lines */}
-                      <div className="space-y-2">
-                        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-full skeleton-shimmer"></div>
-                        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-11/12 skeleton-shimmer"></div>
-                        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-4/5 skeleton-shimmer"></div>
-                        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-full skeleton-shimmer"></div>
-                        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-3/4 skeleton-shimmer"></div>
-                      </div>
-                      
-                      {/* Skeleton citations */}
-                      <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-600">
-                        <div className="flex items-center gap-1 mb-2">
-                          <div className="w-3 h-3 bg-gray-200 dark:bg-gray-700 rounded skeleton-shimmer"></div>
-                          <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-16 skeleton-shimmer"></div>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {[1, 2, 3, 4].map((i) => (
-                            <div key={i} className="h-6 bg-gray-200 dark:bg-gray-700 rounded-full w-20 skeleton-shimmer"></div>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    <style dangerouslySetInnerHTML={{
-                      __html: `
-                        .skeleton-shimmer {
-                          position: relative;
-                          overflow: hidden;
-                        }
-                        
-                        .skeleton-shimmer::after {
-                          content: '';
-                          position: absolute;
-                          top: 0;
-                          left: 0;
-                          width: 100%;
-                          height: 100%;
-                          background: linear-gradient(90deg, 
-                            transparent 0%, 
-                            rgba(255, 255, 255, 0.4) 50%, 
-                            transparent 100%
-                          );
-                          animation: shimmer 1.5s infinite;
-                          transform: translateX(-100%);
-                        }
-                        
-                        .dark .skeleton-shimmer::after {
-                          background: linear-gradient(90deg, 
-                            transparent 0%, 
-                            rgba(255, 255, 255, 0.1) 50%, 
-                            transparent 100%
-                          );
-                        }
-                        
-                        @keyframes shimmer {
-                          0% {
-                            transform: translateX(-100%);
-                          }
-                          100% {
-                            transform: translateX(100%);
-                          }
-                        }
-                      `
-                    }} />
-                  </div>
-                ) : summaryMessage ? (
-                  <div className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700">
-                    <div className=" prose-sm max-w-none text-gray-700 dark:text-gray-300 max-h-48 overflow-y-auto">
-                      {typeof formatMessage(summaryMessage.content) === 'string' ? (
-                        <p>{summaryMessage.content}</p>
-                      ) : (
-                        formatMessage(summaryMessage.content)
-                      )}
-                    </div>
-                    
-                    {/* Citations for summary */}
-                    {summaryMessage.citations && summaryMessage.citations.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-gray-200 dark:border-gray-600">
-                        <h4 className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-2 flex items-center gap-1">
-                          <FileText className="w-3 h-3" />
-                          Sources ({summaryMessage.citations.length})
-                        </h4>
-                        <div className="flex flex-wrap gap-2">
-                          {summaryMessage.citations.slice(0, 8).map((citation, index) => (
-                            <div key={index} className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded-full text-xs text-gray-700 dark:text-gray-300">
-                              <FileText className="w-3 h-3" />
-                              <span className="truncate max-w-24" title={citation.title}>
-                                {citation.title}
-                              </span>
-                            </div>
-                          ))}
-                          {summaryMessage.citations.length > 8 && (
-                            <div className="inline-flex items-center px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded-full text-xs text-gray-500 dark:text-gray-400">
-                              +{summaryMessage.citations.length - 8} more
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Messages Area - Fixed height with scroll */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
-        {chatMessages.length === 0 && !isGeneratingSummary && !showSkeletonLoading && (
+    <div className="h-full flex flex-col overflow-hidden relative">
+      {/* Messages Area - Clara Style */}
+      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3 min-h-0 custom-scrollbar relative z-10">
+        {(!chatMessages || chatMessages.length === 0) && (
           <div className="flex items-center justify-center h-full">
-            <div className="text-center">
-              <MessageSquare className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+            <div className="text-center glassmorphic bg-white/60 dark:bg-gray-800/60 backdrop-blur-xl rounded-3xl border border-white/30 dark:border-gray-700/30 shadow-2xl p-10 max-w-lg">
+              <div className="w-20 h-20 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-2xl ring-4 ring-white/20">
+                <MessageSquare className="w-10 h-10 text-white drop-shadow-lg" />
+              </div>
               {documentCount === 0 ? (
                 <div>
-                  <p className="text-gray-500 dark:text-gray-400 mb-2">
-                    No documents uploaded yet
-                  </p>
-                  <p className="text-sm text-gray-400 dark:text-gray-500">
+                  <h3 className="text-gray-900 dark:text-white font-bold text-xl mb-4">
+                    Welcome to Your Knowledge Base
+                  </h3>
+                  <p className="text-gray-600 dark:text-gray-400 mb-6 leading-relaxed">
                     Upload documents to start chatting and ask questions about your content
                   </p>
+                  <div className="inline-flex items-center gap-3 glassmorphic bg-blue-50/80 dark:bg-blue-900/30 px-6 py-3 rounded-2xl border border-blue-200/50 dark:border-blue-700/30">
+                    <Upload className="w-5 h-5 text-blue-700 dark:text-blue-400 drop-shadow-sm" />
+                    <span className="text-blue-700 dark:text-blue-300 font-semibold">Get started by uploading files</span>
+                  </div>
                 </div>
               ) : completedDocumentCount === 0 ? (
                 <div>
-                  <p className="text-gray-500 dark:text-gray-400 mb-2">
-                    Documents are being processed
+                  <h3 className="text-gray-900 dark:text-white font-bold text-xl mb-4">
+                    Processing Your Documents
+                  </h3>
+                  <p className="text-gray-600 dark:text-gray-400 mb-6 leading-relaxed">
+                    Please wait while we analyze your documents
                   </p>
-                  <p className="text-sm text-gray-400 dark:text-gray-500">
-                    Please wait for processing to complete before starting a conversation
-                  </p>
+                  <div className="flex items-center justify-center gap-3 glassmorphic bg-yellow-50/80 dark:bg-yellow-900/30 px-6 py-3 rounded-2xl border border-yellow-200/50 dark:border-yellow-700/30">
+                    <div className="w-3 h-3 bg-yellow-500 rounded-full animate-pulse shadow-lg"></div>
+                    <div className="w-3 h-3 bg-yellow-500 rounded-full animate-pulse shadow-lg" style={{ animationDelay: '0.2s' }}></div>
+                    <div className="w-3 h-3 bg-yellow-500 rounded-full animate-pulse shadow-lg" style={{ animationDelay: '0.4s' }}></div>
+                    <span className="text-yellow-700 dark:text-yellow-300 font-semibold">Processing in progress...</span>
+                  </div>
                 </div>
               ) : (
-                <p className="text-gray-500 dark:text-gray-400">
-                  {summaryMessage ? 'Ask questions about your documents' : 'Start a conversation about your documents'}
-                </p>
+                <div>
+                  <h3 className="text-gray-900 dark:text-white font-bold text-xl mb-4">
+                    Ready to Chat
+                  </h3>
+                  <p className="text-gray-600 dark:text-gray-400 leading-relaxed">
+                    Start a conversation about your documents
+                  </p>
+                </div>
               )}
             </div>
           </div>
         )}
 
-        {chatMessages.map((message) => (
+        {(chatMessages || []).map((message) => (
           <div
             key={message.id}
-            className={`flex gap-3 ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
+            className={`flex gap-2 ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
           >
             {message.type === 'assistant' && (
-              <div className="flex-shrink-0 w-8 h-8 bg-sakura-500 rounded-full flex items-center justify-center">
-                <Bot className="w-4 h-4 text-white" />
+              <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center shadow-xl ring-2 ring-white/10 backdrop-blur-sm">
+                <Bot className="w-5 h-5 text-white" />
               </div>
             )}
             
-            <div className={`max-w-3xl ${message.type === 'user' ? 'order-1' : ''}`}>
+            <div className={`max-w-2xl ${message.type === 'user' ? 'order-1 min-w-80' : ''}`}>
               <div
-                className={`rounded-lg p-4 ${
+                className={`glassmorphic backdrop-blur-xl rounded-2xl p-4 shadow-xl transition-all duration-300 hover:shadow-2xl border ${
                   message.type === 'user'
-                    ? 'bg-sakura-500 text-white ml-auto'
-                    : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700'
+                    ? 'bg-gradient-to-br from-blue-500/90 to-purple-600/90 text-white ml-auto border-blue-400/30 shadow-blue-500/20'
+                    : 'bg-white/70 dark:bg-gray-800/70 text-gray-900 dark:text-white border-white/30 dark:border-gray-700/30'
                 }`}
               >
-                <div className={` prose-sm max-w-none break-words ${
+                <div className={`prose-sm max-w-none break-words ${
                   message.type === 'user' 
                     ? 'prose-invert' 
                     : 'prose-gray dark:prose-invert'
                 }`}>
                   {typeof formatMessage(message.content) === 'string' ? (
-                    <p className={message.type === 'user' ? 'text-white' : ''}>{message.content}</p>
+                    <p className={`leading-relaxed ${message.type === 'user' ? 'text-white' : 'text-gray-900 dark:text-white'}`}>{message.content}</p>
                   ) : (
-                    <div className={message.type === 'user' ? 'text-white' : ''}>
+                    <div className={`leading-relaxed ${message.type === 'user' ? 'text-white' : 'text-gray-900 dark:text-white'}`}>
                       {formatMessage(message.content)}
                     </div>
                   )}
@@ -665,23 +335,23 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
                 
                 {/* Citations section for assistant messages */}
                 {message.type === 'assistant' && message.citations && message.citations.length > 0 && (
-                  <div className="mt-3 pt-3 border-t border-gray-200 dark:border-gray-600">
-                    <h4 className="text-xs font-medium text-gray-600 dark:text-gray-400 mb-2 flex items-center gap-1">
-                      <FileText className="w-3 h-3" />
+                  <div className="mt-4 pt-4 border-t border-white/20 dark:border-gray-700/30">
+                    <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-400 mb-3 flex items-center gap-2">
+                      <FileText className="w-4 h-4" />
                       Sources ({message.citations.length})
                     </h4>
-                    <div className="space-y-1">
+                    <div className="space-y-1.5">
                       {message.citations.slice(0, 5).map((citation, index) => (
-                        <div key={index} className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
-                          <FileText className="w-3 h-3 flex-shrink-0" />
-                          <span className="truncate" title={citation.file_path}>
+                        <div key={index} className="flex items-center gap-2 glassmorphic bg-white/50 dark:bg-gray-700/50 p-2.5 rounded-lg border border-white/20 dark:border-gray-600/20 text-sm hover:bg-white/70 dark:hover:bg-gray-700/70 transition-all">
+                          <FileText className="w-3.5 h-3.5 flex-shrink-0 text-blue-500" />
+                          <span className="truncate font-medium text-gray-800 dark:text-gray-200" title={citation.file_path}>
                             {citation.title}
                           </span>
-                          <ExternalLink className="w-3 h-3 flex-shrink-0 opacity-50" />
+                          <ExternalLink className="w-3.5 h-3.5 flex-shrink-0 opacity-50" />
                         </div>
                       ))}
                       {message.citations.length > 5 && (
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
+                        <div className="text-sm text-gray-500 dark:text-gray-400 font-medium glassmorphic bg-white/40 dark:bg-gray-700/40 p-2 rounded-lg border border-white/20 dark:border-gray-600/20 text-center">
                           +{message.citations.length - 5} more sources
                         </div>
                       )}
@@ -689,10 +359,10 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
                   </div>
                 )}
                 
-                <div className="flex items-center justify-between mt-3 pt-2 border-t border-gray-200 dark:border-gray-600">
-                  <span className={`text-xs ${
+                <div className="flex items-center justify-between mt-3 pt-2 border-t border-white/20 dark:border-gray-700/30">
+                  <span className={`text-xs font-medium ${
                     message.type === 'user' 
-                      ? 'text-gray-100' 
+                      ? 'text-white/70' 
                       : 'text-gray-500 dark:text-gray-400'
                   }`}>
                     {formatTime(message.timestamp)}
@@ -701,13 +371,13 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
                   {message.type === 'assistant' && (
                     <button
                       onClick={() => copyToClipboard(message.content, message.id)}
-                      className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+                      className="glassmorphic bg-white/50 dark:bg-gray-700/50 hover:bg-white/70 dark:hover:bg-gray-700/70 p-1.5 rounded-lg border border-white/20 dark:border-gray-600/20 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-all shadow-md"
                       title="Copy message"
                     >
                       {copiedId === message.id ? (
-                        <Check className="w-4 h-4 text-green-500" />
+                        <Check className="w-3.5 h-3.5 text-emerald-500" />
                       ) : (
-                        <Copy className="w-4 h-4" />
+                        <Copy className="w-3.5 h-3.5" />
                       )}
                     </button>
                   )}
@@ -716,23 +386,24 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
             </div>
 
             {message.type === 'user' && (
-              <div className="flex-shrink-0 w-8 h-8 bg-gray-600 dark:bg-gray-700 rounded-full flex items-center justify-center">
-                <User className="w-4 h-4 text-white" />
+              <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-emerald-500 to-green-600 rounded-xl flex items-center justify-center shadow-xl ring-2 ring-white/10 backdrop-blur-sm">
+                <User className="w-5 h-5 text-white" />
               </div>
             )}
           </div>
         ))}
 
         {isLoading && (
-          <div className="flex gap-3 justify-start">
-            <div className="flex-shrink-0 w-8 h-8 bg-sakura-500 rounded-full flex items-center justify-center">
-              <Bot className="w-4 h-4 text-white" />
+          <div className="flex gap-2 justify-start">
+            <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center shadow-xl ring-2 ring-white/10 backdrop-blur-sm">
+              <Bot className="w-5 h-5 text-white" />
             </div>
-            <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-              <div className="flex items-center space-x-2">
-                <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
-                <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
-                <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+            <div className="glassmorphic bg-white/70 dark:bg-gray-800/70 backdrop-blur-xl rounded-2xl p-4 shadow-xl border border-white/30 dark:border-gray-700/30">
+              <div className="flex items-center space-x-3">
+                <div className="w-2.5 h-2.5 bg-gradient-to-r from-blue-400 to-purple-500 rounded-full animate-bounce shadow-md"></div>
+                <div className="w-2.5 h-2.5 bg-gradient-to-r from-purple-400 to-pink-500 rounded-full animate-bounce shadow-md" style={{ animationDelay: '0.2s' }}></div>
+                <div className="w-2.5 h-2.5 bg-gradient-to-r from-pink-400 to-red-500 rounded-full animate-bounce shadow-md" style={{ animationDelay: '0.4s' }}></div>
+                <span className="text-gray-700 dark:text-gray-300 font-medium ml-2">AI is thinking...</span>
               </div>
             </div>
           </div>
@@ -743,27 +414,36 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
 
       {/* Backend Status Warning */}
       {(!isBackendHealthy || completedDocumentCount === 0) && (
-        <div className="flex-shrink-0 px-4 py-2 bg-red-50 dark:bg-red-900/20">
-          <div className="flex items-center text-red-700 dark:text-red-300">
-            <AlertTriangle className="w-4 h-4 mr-2" />
-            <span className="text-sm">
-              {!isBackendHealthy 
-                ? "Backend unavailable - Chat functionality is limited"
-                : completedDocumentCount === 0 && documentCount > 0
-                  ? `Processing ${documentCount} document${documentCount !== 1 ? 's' : ''} - Chat will be available once processing completes (Don't Worry this can run in the background - You can access other features meanwhile)`
-                  : documentCount === 0 
-                    ? "Upload documents to enable chat functionality"
-                    : ""
-              }
-            </span>
+        <div className="flex-shrink-0 px-6 py-3 glassmorphic bg-red-50/80 dark:bg-red-900/30 backdrop-blur-xl border-t border-red-200/50 dark:border-red-700/30 shadow-lg relative z-10">
+          <div className="flex items-center">
+            <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-red-500 to-orange-500 rounded-xl flex items-center justify-center mr-4 shadow-lg">
+              <AlertTriangle className="w-5 h-5 text-white" />
+            </div>
+            <div className="flex-1">
+              <span className="text-sm font-semibold text-red-800 dark:text-red-200">
+                {!isBackendHealthy 
+                  ? "Backend unavailable - Chat functionality is limited"
+                  : completedDocumentCount === 0 && documentCount > 0
+                    ? `Processing ${documentCount} document${documentCount !== 1 ? 's' : ''} - Chat will be available once complete`
+                    : documentCount === 0 
+                      ? "Upload documents to enable chat functionality"
+                      : ""
+                }
+              </span>
+              {completedDocumentCount === 0 && documentCount > 0 && (
+                <p className="text-xs text-red-700 dark:text-red-300 mt-1 font-medium">
+                  Don't worry, this runs in the background - You can access other features meanwhile
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}
 
-      {/* Input Area */}
-      <div className="flex-shrink-0 p-4 bg-white dark:bg-black glassmorphic">
+      {/* Clara-Style Input Area - Compact & Elegant */}
+      <div className="flex-shrink-0 p-6 relative z-10">
         <div className="max-w-4xl mx-auto">
-          <div className="relative bg-white dark:bg-black border border-gray-200 dark:border-gray-700 rounded-2xl shadow-sm hover:shadow-md transition-shadow duration-200 glassmorphic">
+          <div className="glassmorphic bg-white/70 dark:bg-gray-900/50 backdrop-blur-2xl border border-white/30 dark:border-gray-700/30 rounded-2xl shadow-2xl transition-all duration-300 hover:shadow-3xl hover:border-gray-300/50 dark:hover:border-gray-600/50 group relative">
             <textarea
               ref={textareaRef}
               value={inputMessage}
@@ -776,32 +456,22 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
                     ? "Processing documents..."
                     : documentCount === 0 
                       ? "Upload documents to start chatting..."
-                      : "Message your notebook..."
+                      : "Ask me anything about your documents..."
               }
               disabled={!isBackendHealthy || isLoading || completedDocumentCount === 0}
-              className="w-full p-4 pr-24 bg-transparent text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400 resize-none focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed rounded-2xl"
-              style={{ minHeight: '56px', maxHeight: '200px' }}
+              className="w-full p-4 pr-16 bg-transparent text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 resize-none focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed rounded-2xl leading-relaxed group-hover:placeholder-gray-500 dark:group-hover:placeholder-gray-400 transition-all duration-200"
+              style={{ minHeight: '56px', maxHeight: '120px' }}
             />
             
-            {/* Action Buttons */}
-            <div className="absolute right-3 bottom-3 flex items-center gap-2">
-              {/* Upload Button */}
-              <button
-                onClick={() => setShowUploadModal(true)}
-                className="flex items-center gap-2 px-3 py-2 rounded-lg transition-all duration-200 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
-              >
-                <Upload className="w-4 h-4" />
-                <span className="text-sm font-medium">Upload Files</span>
-              </button>
-              
-              {/* Send Button */}
+            {/* Send Button */}
+            <div className="absolute right-2 bottom-2">
               <button
                 onClick={handleSendMessage}
                 disabled={!inputMessage.trim() || isLoading || !isBackendHealthy || completedDocumentCount === 0}
-                className={`p-2 rounded-lg transition-all duration-200 ${
+                className={`p-3 rounded-xl transition-all duration-300 transform glassmorphic border shadow-lg ${
                   inputMessage.trim() && !isLoading && isBackendHealthy && completedDocumentCount > 0
-                    ? 'bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100 shadow-sm hover:shadow-md'
-                    : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'
+                    ? 'bg-gradient-to-r from-blue-500 to-purple-600 text-white hover:from-blue-600 hover:to-purple-700 hover:shadow-xl hover:scale-105 border-blue-400/30'
+                    : 'bg-gray-200/60 dark:bg-gray-700/60 text-gray-400 dark:text-gray-500 cursor-not-allowed border-gray-300/30 dark:border-gray-600/30'
                 }`}
               >
                 <Send className="w-4 h-4" />
@@ -809,15 +479,18 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
             </div>
           </div>
           
-          {/* Helper Text */}
-          <div className="flex items-center justify-between mt-2 px-2">
-            <p className="text-xs text-gray-500 dark:text-gray-400">
+          {/* Helper Text - Compact */}
+          <div className="flex items-center justify-between mt-3 px-3">
+            <p className="text-xs text-gray-500 dark:text-gray-400 font-medium">
               Press Enter to send, Shift+Enter for new line
             </p>
             {isBackendHealthy && completedDocumentCount > 0 && (
-              <p className="text-xs text-gray-400 dark:text-gray-500">
-                {completedDocumentCount} of {documentCount} documents ready
-              </p>
+              <div className="flex items-center gap-2 glassmorphic bg-emerald-50/80 dark:bg-emerald-900/30 px-3 py-1 rounded-xl border border-emerald-200/50 dark:border-emerald-700/30">
+                <div className="w-2 h-2 bg-emerald-500 rounded-full shadow-sm animate-pulse"></div>
+                <p className="text-xs text-emerald-700 dark:text-emerald-300 font-semibold">
+                  {completedDocumentCount} of {documentCount} documents ready
+                </p>
+              </div>
             )}
           </div>
         </div>
@@ -833,10 +506,31 @@ const NotebookChat: React.FC<NotebookChatProps> = ({ notebookId, documentCount, 
 
       {/* Progress Indicator */}
       {progressState && progressState.isActive && (
-        <ProgressIndicator progress={progressState} />
+        <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="glassmorphic bg-white/90 dark:bg-gray-900/90 backdrop-blur-xl rounded-2xl p-6 shadow-2xl border border-white/30 dark:border-gray-700/30 min-w-80">
+            <div className="flex items-center gap-4">
+              <div className="w-8 h-8 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center">
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              </div>
+              <div className="flex-1">
+                <p className="font-semibold text-gray-900 dark:text-white">{progressState.message}</p>
+                {progressState.details && (
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{progressState.details}</p>
+                )}
+                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2 mt-3">
+                  <div 
+                    className="bg-gradient-to-r from-blue-500 to-purple-600 h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${progressState.progress}%` }}
+                  ></div>
+                </div>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-2 text-right">{progressState.progress}%</p>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
 };
 
-export default NotebookChat; 
+export default NotebookChat;
