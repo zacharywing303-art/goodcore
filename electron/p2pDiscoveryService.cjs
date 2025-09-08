@@ -19,6 +19,7 @@ class P2PDiscoveryService {
     this.localPeer = null;
     this.discoveryInterval = null;
     this.mainWindow = null;
+    this.currentPairingCode = null; // Store the current pairing code
     
     // Setup IPC handlers
     this.setupIPCHandlers();
@@ -46,7 +47,10 @@ class P2PDiscoveryService {
     });
 
     ipcMain.handle('p2p:generate-pairing-code', () => {
-      return this.generatePairingCode();
+      if (!this.currentPairingCode) {
+        this.generatePairingCode();
+      }
+      return this.currentPairingCode;
     });
 
     ipcMain.handle('p2p:update-config', async (event, updates) => {
@@ -60,6 +64,11 @@ class P2PDiscoveryService {
       
       this.isEnabled = true;
       this.initializeLocalPeer();
+      
+      // Generate initial pairing code
+      if (!this.currentPairingCode) {
+        this.generatePairingCode();
+      }
       
       // Start UDP discovery server
       await this.startUDPDiscovery();
@@ -141,7 +150,9 @@ class P2PDiscoveryService {
     const words = ['BRAIN', 'NOVA', 'STAR', 'CORE', 'DATA', 'SYNC', 'FLOW', 'LINK'];
     const word = words[Math.floor(Math.random() * words.length)];
     const number = Math.floor(1000 + Math.random() * 9000);
-    return `${word}-${number}`;
+    this.currentPairingCode = `${word}-${number}`;
+    console.log(`🔑 Generated pairing code: ${this.currentPairingCode}`);
+    return this.currentPairingCode;
   }
 
   async startUDPDiscovery() {
@@ -309,9 +320,15 @@ class P2PDiscoveryService {
   handlePairingRequest(body, res) {
     try {
       const data = JSON.parse(body);
-      const currentCode = this.generatePairingCode(); // In a real implementation, this would be stored/managed
       
-      if (data.pairingCode === currentCode) {
+      // Use stored pairing code, generate one if not exists
+      if (!this.currentPairingCode) {
+        this.generatePairingCode();
+      }
+      
+      console.log(`🔍 Checking pairing code: ${data.pairingCode} against ${this.currentPairingCode}`);
+      
+      if (data.pairingCode === this.currentPairingCode) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           success: true,
@@ -327,7 +344,7 @@ class P2PDiscoveryService {
           error: 'Invalid pairing code'
         }));
         
-        console.log(`❌ Invalid pairing attempt: ${data.pairingCode}`);
+        console.log(`❌ Invalid pairing attempt: ${data.pairingCode} (expected: ${this.currentPairingCode})`);
       }
     } catch (error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
