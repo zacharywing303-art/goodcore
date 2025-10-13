@@ -7,6 +7,7 @@ import MCPSettings from './MCPSettings';
 import ToolBelt from './ToolBelt';
 import UnifiedServiceManager from './Settings/UnifiedServiceManager';
 import StartupTab from './Settings/StartupTab';
+import RemoteServerSetup from './Settings/RemoteServerSetup';
 import { 
   DEFAULT_UI_PREFERENCES, 
   FONT_SCALE_OPTIONS, 
@@ -76,7 +77,7 @@ const Settings = () => {
   // Sub-tabs for each main category
   const [activeInterfaceTab, setActiveInterfaceTab] = useState<'appearance' | 'ui-preferences'>('appearance');
   const [activeAITab, setActiveAITab] = useState<'api' | 'mcp'>('api');
-  const [activeSystemTab, setActiveSystemTab] = useState<'startup' | 'services' | 'toolbelt' | 'updates'>('startup');
+  const [activeSystemTab, setActiveSystemTab] = useState<'startup' | 'services' | 'toolbelt' | 'updates' | 'remote-server'>('startup');
   
   // Keep legacy activeTab for backward compatibility during transition
   const [activeTab, setActiveTab] = useState<'personal' | 'api' | 'preferences' | 'mcp' | 'toolbelt' | 'updates' | 'sdk-demo' | 'servers' | 'startup'>('api');
@@ -110,6 +111,7 @@ const Settings = () => {
       const selected = activeSystemTab || 'startup';
       if (selected === 'startup') return 'startup';
       if (selected === 'services') return 'servers';
+      if (selected === 'remote-server') return 'remote-server' as any;
       return selected as 'toolbelt' | 'updates';
     }
     return 'api'; // default
@@ -1860,6 +1862,16 @@ const Settings = () => {
                     }`}
                   >
                     Updates
+                  </button>
+                  <button
+                    onClick={() => setActiveSystemTab('remote-server')}
+                    className={`flex items-center px-2.5 py-1.5 rounded-md text-sm transition-colors ${
+                      activeSystemTab === 'remote-server'
+                        ? 'text-sakura-600 dark:text-sakura-300 font-medium'
+                        : 'text-gray-700 dark:text-gray-200 hover:text-gray-900 dark:hover:text-gray-100'
+                    }`}
+                  >
+                    Remote Server
                   </button>
                 </div>
               )}
@@ -3996,6 +4008,11 @@ const ProcessButton = () => {
                 </div>
               </div>
             </div>
+          )}
+
+          {/* Remote Server Tab */}
+          {effectiveActiveTab === 'remote-server' && (
+            <RemoteServerSetup />
           )}
         </div>
       </div>
