@@ -321,7 +321,7 @@ const Settings = () => {
     { id: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', type: 'openai', brandDomain: 'openai.com', hasFree: true, freeDetails: '$5 free credits on signup', signupUrl: 'https://platform.openai.com/signup' },
     { id: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', type: 'openrouter', brandDomain: 'openrouter.ai', hasFree: true, freeDetails: 'Free tier with daily limits', signupUrl: 'https://openrouter.ai/keys' },
     { id: 'groq', label: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', type: 'openai_compatible', brandDomain: 'groq.com', hasFree: true, freeDetails: 'Generous free tier', signupUrl: 'https://console.groq.com/keys' },
-    { id: 'gemini', label: 'Google Gemini', baseUrl: 'https://cloudaicompanion.googleapis.com', type: 'openai_compatible', brandDomain: 'gemini.google.com', hasFree: true, freeDetails: 'Free tier available', signupUrl: 'https://aistudio.google.com/app/apikey' },
+    { id: 'gemini', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', type: 'openai_compatible', brandDomain: 'gemini.google.com', hasFree: true, freeDetails: 'Free tier available', signupUrl: 'https://aistudio.google.com/app/apikey' },
     { id: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', type: 'openai_compatible', brandDomain: 'deepseek.com', hasFree: true, freeDetails: 'Free tier with limits', signupUrl: 'https://platform.deepseek.com/api_keys' },
     
     // 🚀 Fast & Popular Cloud Services
