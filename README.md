@@ -1,3 +1,11 @@
+# ClaraVerse Desktop Application
+
+> **Note:** This repository was previously located at [claraverse-space/ClaraVerse](https://github.com/claraverse-space/ClaraVerse). 
+> The main ClaraVerse project (web-based) continues development at that location.
+> This repository contains the **Electron desktop app** version.
+
+---
+
 <div align="center">
 
 <br/>
